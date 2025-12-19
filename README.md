@@ -8,7 +8,8 @@ M.A.I.A. Is an ever-evolving infrastructure that allows the user to call locally
 
 ### Once finished:
 
-*   Double-click on **MAIA**
+*   Double-click on **MAIA** to start the script.
+
     **NOTE:** You can move the *MAIA* file anywhere on your PC and it should work. **Do not move** the rest of the folders and files.
 
 ---
@@ -158,3 +159,7 @@ A notification will confirm the prompt was sent.
 7.  **Memory Manager** – Opens the Memory Handler
 8.  **Coding Mode** – Assisted Python code development with dual AI (*Beta*)
 9.  **Pinned (ON/OFF)** – Keeps the window always on top
+
+### FIle Upload Update:
+The program now allows to upload multiple files and select them for Retrieval Augmented Generation. 
+It currently supports pdf and docx files, although I'm working on expanding the file types, especially to handle dataframes by automatically formatting them in TOON.

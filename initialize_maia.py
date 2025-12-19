@@ -53,6 +53,9 @@ def install_package_with_retry(pip_exe, package):
     return True
 
 def main():
+    current_directory = os.path.dirname(os.path.abspath(__file__))
+    requirements_path = os.path.join(current_directory, "requirements.txt")
+    core_req_path = os.path.join(current_directory, "core_requirements.txt")
     sys.stdout.reconfigure(encoding='utf-8')
     
     # Check if THIS script is running on compatible python
@@ -102,23 +105,31 @@ def main():
 
     # 2.2 Core Engine (Pinned for Stability)
     print("\n--- Installing Core Engine ---")
-    core_deps = [
-        "numpy<2.0.0", 
-        "typing_extensions",
-        "pydantic>=2.6.0", 
-        "spacy>=3.7.5"
-    ]
+    try:
+        with open(core_req_path, "r") as f:
+            # line.strip() removes newlines (\n) and spaces
+            core_deps = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(f"Error: The file '{core_req_path}' was not found.")
+        core_deps = []
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        core_deps = []
     for dep in core_deps:
         subprocess.call([pip_exe, "install", "--no-cache-dir", dep])
 
+
     # 2.3 Main Libraries
-    dependencies = [
-        "pywin32", "transformers", "torch", "sentence-transformers",
-        "PyPDF2", "openpyxl", "python-docx", "reportlab", "pandas",
-        "langchain", "langchain-community", "langchain-core", "langchain-huggingface",
-        "trafilatura", "requests", "faiss-cpu", "chromadb", "beautifulsoup4", 
-        "fake-useragent", "pyautogui", "snac", "soundfile"
-    ]
+    try:
+        with open(requirements_path, "r") as f:
+            # line.strip() removes newlines (\n) and spaces
+            dependencies = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(f"Error: The file '{requirements_path}' was not found.")
+        dependencies = []
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        dependencies = []
     
     print("\n--- Installing Support Libraries ---")
     for dep in dependencies:

@@ -1,0 +1,25 @@
+pywin32
+transformers
+torch
+sentence-transformers
+PyPDF2
+openpyxl
+python-docx
+reportlab
+pandas
+langchain
+langchain-community
+langchain-core
+langchain-huggingface
+trafilatura
+requests
+faiss-cpu
+chromadb
+beautifulsoup4
+fake-useragent
+pyautogui
+snac
+soundfile
+tkinterdnd2
+demoji
+pip install docx2pdf

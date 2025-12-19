@@ -18,11 +18,17 @@ from tkinter import ttk
 from PyPDF2 import PdfReader
 import openpyxl
 from docx import Document
+from docx.shared import RGBColor
+try:
+    from docx2pdf import convert
+except ImportError:
+    convert = None
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import pandas as pd
 from ai_script_cleaner import extract_python_code
 
+import demoji
 from langchain_community.chat_models import ChatOllama
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import torch
@@ -35,12 +41,16 @@ from sentence_transformers import SentenceTransformer
 from embedder import inquire
 from codeduo import codeduo
 from metadata_creator import enrich_prompt
-
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.enums import TA_LEFT
 import glob
 import time
 from datetime import date
 import chromadb
 from chromadb.utils import embedding_functions
+from tkinterdnd2 import TkinterDnD, DND_FILES 
+from dragndrop import dragndrop 
 from langchain_core.prompts import ChatPromptTemplate
 try:
     from langchain_core.messages import HumanMessage, AIMessage, SystemMessage    
@@ -75,6 +85,8 @@ Path(EMBEDDINGS_DIR).mkdir(exist_ok=True)
 EPISODES_DIR = os.path.join(BASE_DIR, "episodes")
 os.makedirs(EPISODES_DIR, exist_ok=True)
 DB_PATH = os.path.join(BASE_DIR, "maia_db")
+RAG_DIR = os.path.join(BASE_DIR, "rag")
+os.makedirs(RAG_DIR, exist_ok=True)
 MAX_MEMORY_SIZE = 1000
 DEFAULT_MODEL = "gemma3n:e4b"
 
@@ -203,6 +215,12 @@ DEFAULT_MEMORY_ANALIZER_PROMPT = """Analyze the provided chat log.
 Output a JSON object with a key 'memories' containing a list of objects with keys 'topic' and 'learning'.
 """
 
+# --- NEW: Default Prompt for Consolidator ---
+DEFAULT_CONSOLIDATOR_PROMPT = """You are a memory optimizer. 
+Combine the provided list of similar learnings into ONE single, concise, comprehensive learning. 
+Do not lose important details, but remove redundancy. 
+Output JSON: {'topic': '...', 'learning': '...'}"""
+
 # Expanded Default Configuration with System Prompts
 DEFAULT_CONFIG = {
     "main": {
@@ -234,6 +252,11 @@ DEFAULT_CONFIG = {
         "provider": "ollama", "model": DEFAULT_MODEL, 
         "temperature": 0.1, "max_tokens": 2048, "top_p": 0.5, "api_key": "",
         "system_prompt": DEFAULT_MEMORY_ANALIZER_PROMPT
+    },
+        "memory_consolidator": {
+        "provider": "ollama", "model": DEFAULT_MODEL, 
+        "temperature": 0.1, "max_tokens": 2048, "top_p": 0.5, "api_key": "",
+        "system_prompt": DEFAULT_CONSOLIDATOR_PROMPT
     },
         "retrieval": {
         "rag_k": 3,
@@ -302,6 +325,221 @@ def messages_to_string(messages):
             prompt_text += f"{content}\n"
     prompt_text += "Assistant: "
     return prompt_text
+
+
+# ==========================================
+#       RAG MANAGER FOR DOCUMENTS
+# ==========================================
+
+class DocumentRAGManager:
+    """Manages embeddings for specific documents in the ./rag folder."""
+    def __init__(self, model):
+        self.model = model 
+        self.active_indices = {} # {filename: (faiss_index, chunks)}
+        if not os.path.exists(RAG_DIR):
+            os.makedirs(RAG_DIR)
+
+    def get_file_hash(self, file_path):
+        with open(file_path, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+
+    def embed_file(self, file_path):
+        """Chunks and embeds a file, saving the index in ./rag."""
+        if self.model is None:
+            logger.error("Embedding model not available for Document RAG.")
+            return
+
+        file_hash = self.get_file_hash(file_path)
+        index_path = os.path.join(RAG_DIR, f"{file_hash}.index")
+        chunks_path = os.path.join(RAG_DIR, f"{file_hash}.pkl")
+
+        if file_path in self.active_indices:
+            return
+
+        if os.path.exists(index_path) and os.path.exists(chunks_path):
+            index = faiss.read_index(index_path)
+            with open(chunks_path, 'rb') as f:
+                chunks = pickle.load(f)
+            self.active_indices[file_path] = (index, chunks)
+            return
+
+        ext = os.path.splitext(file_path)[1].lower()
+        content = ""
+        if ext == ".pdf": content = read_pdf(file_path)
+        elif ext == ".docx": content = read_word(file_path)
+        elif ext in [".xlsx", ".xls"]: 
+            res = read_excel_enhanced(file_path)
+            content = res[0] if isinstance(res, tuple) else res
+        else:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except: return
+
+        if not content: return
+
+        chunks = chunk_text(content)
+        # Change: Use self.model instead of global embed_model
+        embeddings = self.model.encode(chunks, convert_to_numpy=True)
+        
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings.astype('float32'))
+
+        faiss.write_index(index, index_path)
+        with open(chunks_path, 'wb') as f:
+            pickle.dump(chunks, f)
+            
+        self.active_indices[file_path] = (index, chunks)
+
+    def query_active_files(self, query, k=5):
+        """Searches only the files selected by the user."""
+        context = ""
+        for file_path, (index, chunks) in self.active_indices.items():
+            results = query_index(query, chunks, index, k=k)
+            if results:
+                context += f"\n--- FROM DOCUMENT: {os.path.basename(file_path)} ---\n"
+                context += "\n".join(results) + "\n"
+        return context
+
+
+
+
+
+class MaiaAttachmentsDialog(tk.Toplevel):
+    def __init__(self, master, existing_files, existing_rag):
+        super().__init__(master)
+        self.title("M.A.I.A. Attachments & RAG Manager")
+        self.geometry("700x550")
+        self.configure(bg="#1e1e1e")
+
+        # PERSISTENCE LOGIC
+        # We work on copies so we can "Cancel" if we want, 
+        # but CrewChatUI will update its master lists on "Confirm"
+        self.attachments = list(existing_files) 
+        self.rag_active = set(existing_rag)
+        self.confirmed = False
+
+        # Make modal
+        self.transient(master)
+        self.grab_set()
+
+        # UI Styling
+        lbl_style = {"bg": "#1e1e1e", "fg": "white", "font": ("Segoe UI", 10)}
+
+        # ===== FILE LIST =====
+        tk.Label(self, text="Current Session Attachments:", **lbl_style).pack(pady=(10, 0))
+        list_frame = tk.Frame(self, bg="#1e1e1e")
+        list_frame.pack(fill="both", expand=True, padx=15, pady=5)
+
+        self.listbox = tk.Listbox(
+            list_frame, bg="#2d2d2d", fg="white", 
+            selectmode=tk.SINGLE, font=("Consolas", 10),
+            borderwidth=0, highlightthickness=1, highlightbackground="#444"
+        )
+        self.listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(list_frame, command=self.listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=scrollbar.set)
+
+        # ===== RAG CONTROLS =====
+        rag_frame = tk.Frame(self, bg="#1e1e1e")
+        rag_frame.pack(fill="x", padx=15, pady=5)
+
+        tk.Button(rag_frame, text="Toggle RAG (Green Mode)", bg="#2ecc71", fg="white",
+                  command=self.toggle_rag_selection, relief="flat", padx=10).pack(side="left")
+        
+        tk.Label(rag_frame, text="Green = Activated for Semantic Search", **lbl_style).pack(side="left", padx=10)
+
+        # ===== ACTION BUTTONS =====
+        btn_frame = tk.Frame(self, bg="#1e1e1e")
+        btn_frame.pack(fill="x", padx=15, pady=10)
+
+        tk.Button(btn_frame, text="Remove Selected", bg="#e74c3c", fg="white",
+                  command=self.remove_selected, relief="flat", padx=10).pack(side="left")
+
+        tk.Button(btn_frame, text="CONFIRM & EXIT", bg="#3498db", fg="white", width=20,
+                  command=self.confirm, relief="flat", font=("Segoe UI", 10, "bold")).pack(side="right")
+
+        # ===== DROP AREA =====
+        # This area handles both Drag & Drop AND Click-to-Browse
+        self.drop_area = tk.Label(
+            self, text="DRAG FILES HERE TO ADD TO SESSION\n(or click here to browse)",
+            relief="ridge", borderwidth=2, height=4, bg="#252525", fg="#00aeff", 
+            font=("Segoe UI", 9, "bold"), cursor="hand2"
+        )
+        self.drop_area.pack(fill="x", padx=15, pady=10)
+
+        # Register Drop Target (This requires DND_FILES to be imported)
+        self.drop_area.drop_target_register(DND_FILES)
+        self.drop_area.dnd_bind("<<Drop>>", self.on_drop)
+        
+        # Click to browse logic
+        self.drop_area.bind("<Button-1>", self.browse_files)
+
+        # Initial Load of existing files
+        self.refresh_listbox()
+
+    def refresh_listbox(self):
+        """Clears and repaints the listbox based on current state."""
+        self.listbox.delete(0, tk.END)
+        for path in self.attachments:
+            fname = os.path.basename(path)
+            self.listbox.insert(tk.END, fname)
+            idx = self.listbox.size() - 1
+            if path in self.rag_active:
+                # Highlight RAG-active files in Green
+                self.listbox.itemconfig(idx, {'bg': '#27ae60', 'fg': 'white'})
+
+    def toggle_rag_selection(self):
+        """Toggles the 'Green' RAG mode for the selected file."""
+        selection = self.listbox.curselection()
+        if not selection: 
+            messagebox.showinfo("Selection Required", "Please click a file in the list first.")
+            return
+        idx = selection[0]
+        path = self.attachments[idx]
+        
+        if path in self.rag_active:
+            self.rag_active.remove(path)
+        else:
+            self.rag_active.add(path)
+        self.refresh_listbox()
+
+    def on_drop(self, event):
+        """Logic for files dropped onto the label."""
+        files = self.tk.splitlist(event.data)
+        self.add_files(files)
+
+    def browse_files(self, event=None):
+        """Logic for clicking the label to open a file dialog."""
+        files = filedialog.askopenfilenames(parent=self, title="Select files to attach")
+        if files: 
+            self.add_files(files)
+
+    def add_files(self, files):
+        """Adds files to the internal list and refreshes UI."""
+        for path in files:
+            path = os.path.normpath(path)
+            if path not in self.attachments:
+                self.attachments.append(path)
+        self.refresh_listbox()
+
+    def remove_selected(self):
+        """Removes selected file from both standard and RAG lists."""
+        selection = self.listbox.curselection()
+        if not selection: return
+        idx = selection[0]
+        path = self.attachments.pop(idx)
+        if path in self.rag_active:
+            self.rag_active.remove(path)
+        self.refresh_listbox()
+
+    def confirm(self):
+        """Marks as confirmed and closes."""
+        self.confirmed = True
+        self.destroy()
+
 
 # ==========================================
 #       MODULAR LLM ARCHITECTURE
@@ -555,15 +793,15 @@ class LocalHFWrapper(UniversalLLMWrapper):
 
 # --- UNIVERSAL CLIENT FACTORY ---
 
-def get_universal_client(component_name: str, override_temp: float = None) -> UniversalLLMWrapper:
+def get_universal_client(component_name: str) -> UniversalLLMWrapper:
     config = LLM_CONFIG.get(component_name, DEFAULT_CONFIG["main"])
     
     provider = config.get("provider", "ollama").lower()
     model = config.get("model", DEFAULT_MODEL)
     api_key = config.get("api_key", "")
-    system_prompt = config.get("system_prompt", "") # Get system prompt
+    system_prompt = config.get("system_prompt", "")
     
-    temperature = override_temp if override_temp is not None else config.get("temperature", 0.7)
+    temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 1024)
     top_p = config.get("top_p", 0.9)
 
@@ -591,9 +829,9 @@ def get_universal_client(component_name: str, override_temp: float = None) -> Un
         return None
 
 # --- BACKWARD COMPATIBILITY / ALIAS ---
-def get_llm_client(component_name, temp=None):
+def get_llm_client(component_name):
     """Alias for legacy calls in the script."""
-    return get_universal_client(component_name, override_temp=temp)
+    return get_universal_client(component_name)
 
 # --- UNIFIED STREAMING HELPER (Simplified) ---
 async def unified_astream(client, messages):
@@ -628,7 +866,7 @@ def validate_ollama_model(model_name):
 
 #==============================================
 
-CLIENT = get_llm_client("main", temp=0.7)
+CLIENT = get_llm_client("main")
 if CLIENT is None:
     # Fallback to avoid crash if main config is bad, allows UI to load
     print("Warning: Main Client failed to load. Using basic fallback or None.")
@@ -827,6 +1065,115 @@ def read_excel(file_path):
     except Exception as e:
         logger.error(f"Error reading Excel file: {e}")
         return None
+    
+def clean_text_for_pdf(text):
+    """
+    Standard PDF fonts don't support emojis. 
+    This replaces emojis with their text aliases (e.g. :robot:) 
+    to preserve meaning and prevent PDF crashes.
+    """
+    try:
+        # If demoji is installed, it gives better text descriptions
+        import demoji
+        return demoji.replace_with_desc(text, sep=" ")
+    except ImportError:
+        # Fallback: strip non-BMP characters (emojis) to prevent ReportLab errors
+        return "".join(c for c in text if ord(c) < 65536)
+
+def write_to_pdf(messages, file_path):
+    """Write structured chat messages to a PDF with word wrapping and emoji handling."""
+    try:
+        doc = SimpleDocTemplate(file_path, pagesize=letter)
+        styles = getSampleStyleSheet()
+        
+        # Custom styles for better appearance
+        user_header = ParagraphStyle('UserHeader', parent=styles['Normal'], textColor='#2980b9', spaceBefore=12, fontName='Helvetica-Bold', fontSize=10)
+        ai_header = ParagraphStyle('AIHeader', parent=styles['Normal'], textColor='#16a085', spaceBefore=12, fontName='Helvetica-Bold', fontSize=10)
+        content_style = ParagraphStyle('ContentStyle', parent=styles['Normal'], spaceAfter=6, leading=14, fontName='Helvetica', fontSize=10)
+
+        story = []
+        story.append(Paragraph("M.A.I.A. Chat Export", styles['Title']))
+        story.append(Spacer(1, 12))
+
+        for msg in messages:
+            if isinstance(msg, SystemMessage): continue
+            
+            role = "USER" if isinstance(msg, HumanMessage) else "M.A.I.A."
+            ts = msg.additional_kwargs.get("timestamp", "No Date")
+            if "T" in ts: ts = ts.replace("T", " ").split(".")[0]
+
+            # 1. Clean emojis for PDF compatibility
+            clean_content = clean_text_for_pdf(msg.content)
+            # 2. Format newlines for ReportLab
+            formatted_content = clean_content.replace('\n', '<br/>')
+
+            # Add Header
+            header_style = user_header if role == "USER" else ai_header
+            story.append(Paragraph(f"{role} | {ts}", header_style))
+            
+            # Add Content
+            story.append(Paragraph(formatted_content, content_style))
+            
+        doc.build(story)
+        logger.info(f"PDF successfully saved to {file_path}")
+    except Exception as e:
+        logger.error(f"Error writing PDF: {e}")
+
+def write_to_word(messages, file_path):
+    """Write structured chat messages to a Word Doc with full emoji support."""
+    try:
+        doc = Document()
+        doc.add_heading('M.A.I.A. Chat Conversation', 0)
+
+        for msg in messages:
+            if isinstance(msg, SystemMessage): continue
+            
+            role = "USER" if isinstance(msg, HumanMessage) else "M.A.I.A."
+            ts = msg.additional_kwargs.get("timestamp", "No Date")
+            if "T" in ts: ts = ts.replace("T", " ").split(".")[0]
+
+            # Header
+            p = doc.add_paragraph()
+            run = p.add_run(f"[{ts}] {role}:")
+            run.bold = True
+            if role == "USER": 
+                run.font.color.rgb = RGBColor(41, 128, 185) # Blue
+            else:
+                run.font.color.rgb = RGBColor(22, 160, 133) # Green
+            
+            # Content (Word handles emojis perfectly)
+            doc.add_paragraph(msg.content)
+            doc.add_paragraph("-" * 30)
+
+        doc.save(file_path)
+    except Exception as e:
+        logger.error(f"Error writing Word file: {e}")
+
+def write_to_excel_structured(messages, file_path):
+    """Save chat to Excel with proper columns for Date, Role, and Content."""
+    try:
+        data = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage): continue
+            
+            role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+            ts = msg.additional_kwargs.get("timestamp", "N/A")
+            if "T" in ts: ts = ts.replace("T", " ").split(".")[0]
+            
+            data.append({
+                "Timestamp": ts,
+                "Author": role,
+                "Message": msg.content
+            })
+        
+        df = pd.DataFrame(data)
+        # Use a context manager to ensure the file is closed properly
+        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Chat History')
+        logger.info(f"Excel file successfully saved to {file_path}")
+    except Exception as e:
+        logger.error(f"Error writing Excel: {e}")
+
 
 def write_to_excel_enhanced(data, file_path):
     """Enhanced Excel writing with better data structure handling."""
@@ -893,21 +1240,7 @@ def create_excel_query_context(structure, query):
     context += "\nRemember: Focus on the data structure and relationships that answer the specific query.\n"
     return context
 
-def write_to_pdf(text, file_path):
-    """Write text to a PDF file."""
-    try:
-        c = canvas.Canvas(file_path, pagesize=letter)
-        lines = text.split('\n')
-        y = 750
-        for line in lines:
-            c.drawString(100, y, line)
-            y -= 15
-            if y < 50:
-                c.showPage()
-                y = 750
-        c.save()
-    except Exception as e:
-        logger.error(f"Error writing to PDF file: {e}")
+
 
 def read_word(file_path):
     """Read text from a Word document."""
@@ -919,14 +1252,7 @@ def read_word(file_path):
         logger.error(f"Error reading Word file: {e}")
         return None
 
-def write_to_word(text, file_path):
-    """Write text to a Word document."""
-    try:
-        doc = Document()
-        doc.add_paragraph(text)
-        doc.save(file_path)
-    except Exception as e:
-        logger.error(f"Error writing to Word file: {e}")
+
 
 def clean_url(url: str) -> str:
     """Remove invalid characters from the end of a URL."""
@@ -1067,26 +1393,52 @@ def embed_chunks(chunks):
     return embed_model.encode(chunks, convert_to_numpy=True)
 
 def query_index(question, chunks, index, k=15):
-    """Query the FAISS index for relevant chunks."""
-    if embed_model is None:
+    """Query the FAISS index for relevant chunks with deduplication."""
+    if embed_model is None or not chunks:
         return chunks[:k] if chunks else []
+
+    # 1. Search the index
     q_emb = embed_model.encode([question], convert_to_numpy=True)
-    D, I = index.search(q_emb, max(2*k, len(chunks)))
+    # Search for more than k to have a pool for filtering
+    D, I = index.search(q_emb, min(len(chunks), 2 * k))
     candidate_indices = I[0]
+
     question_keywords = set(question.lower().split())
     filtered_chunks = []
+    seen_content = set() # To track unique content
+
+    # 2. Add unique chunks
     for idx in candidate_indices:
         if idx < len(chunks):
             chunk = chunks[idx]
-            chunk_keywords = set(chunk.lower().split())
-            if any(keyword in chunk_keywords for keyword in question_keywords):
-                filtered_chunks.append(chunk)
+            # Normalize for comparison
+            content_hash = hashlib.md5(chunk.strip().encode()).hexdigest()
+            
+            if content_hash not in seen_content:
+                # Optional: keyword relevance check
+                chunk_keywords = set(chunk.lower().split())
+                if any(keyword in chunk_keywords for keyword in question_keywords):
+                    filtered_chunks.append(chunk)
+                    seen_content.add(content_hash)
+            
             if len(filtered_chunks) == k:
                 break
+
+    # 3. Fallback: If we didn't find enough keyword-matching chunks, 
+    # add other unique chunks from the candidates until we hit k
     if len(filtered_chunks) < k:
-        remaining_needed = k - len(filtered_chunks)
-        remaining_chunks = [chunks[i] for i in candidate_indices if i < len(chunks) and chunks[i] not in filtered_chunks]
-        filtered_chunks.extend(remaining_chunks[:remaining_needed])
+        for idx in candidate_indices:
+            if idx < len(chunks):
+                chunk = chunks[idx]
+                content_hash = hashlib.md5(chunk.strip().encode()).hexdigest()
+                
+                if content_hash not in seen_content:
+                    filtered_chunks.append(chunk)
+                    seen_content.add(content_hash)
+                
+                if len(filtered_chunks) == k:
+                    break
+
     return filtered_chunks
 #==================================================================
 #                           <\FUNZIONI>
@@ -1557,7 +1909,7 @@ class EpisodicMemoryManager:
 
     def analyze_and_store(self, log_callback, chats='today'):
         """Analyzes today's chats and stores summaries."""
-        analyzer = get_llm_client("memory_analyzer", temp=0.1)
+        analyzer = get_llm_client("memory_analyzer")
         if not analyzer:
             log_callback("Error: Memory Analyzer LLM not configured.")
             return
@@ -1655,14 +2007,14 @@ class EpisodicMemoryManager:
     def consolidate_memories(self, log_callback):
         """
         Iteratively finds and merges similar episodes until no clusters remain.
-        Uses the configured consolidation_threshold.
+        Uses the separate 'memory_consolidator' agent defined in config.
         """
         log_callback("--- STARTING ITERATIVE MEMORY CONSOLIDATION ---")
         
-        # Initialize Analyzer LLM
-        analyzer = get_llm_client("memory_analyzer", temp=0.1)
-        if not analyzer:
-             log_callback("Error: Memory Analyzer LLM not configured.")
+        # --- CHANGED: Use the dedicated Consolidator Agent ---
+        consolidator = get_llm_client("memory_consolidator")
+        if not consolidator:
+             log_callback("Error: Memory Consolidator LLM not configured.")
              return
              
         # Get dynamic threshold from config
@@ -1670,10 +2022,10 @@ class EpisodicMemoryManager:
         merge_threshold = float(retrieval_conf.get("consolidation_threshold", 0.8))
         
         pass_number = 1
-        max_passes = 5  # Safety limit to prevent infinite loops
+        max_passes = 5 
         
         while pass_number <= max_passes:
-            # 1. Refresh Data Snapshot at the start of every pass
+            # 1. Refresh Data Snapshot
             all_data = self.collection.get()
             all_ids = all_data['ids']
             all_docs = all_data['documents']
@@ -1691,11 +2043,10 @@ class EpisodicMemoryManager:
             for i, doc_text in enumerate(all_docs):
                 current_id = all_ids[i]
                 
-                # If this ID was already merged or checked in this pass, skip it
                 if current_id in processed_ids:
                     continue
                 
-                # 3. Query for similar items (Semantic Search)
+                # 3. Query for similar items
                 try:
                     results = self.collection.query(
                         query_texts=[doc_text],
@@ -1708,61 +2059,49 @@ class EpisodicMemoryManager:
                 
                 cluster_ids = []
                 cluster_docs = []
+                cluster_metas = [] 
                 
-                # Filter neighbors by distance
                 if results['ids']:
                     for j, neighbor_id in enumerate(results['ids'][0]):
                         dist = results['distances'][0][j]
                         
-                        # USE DYNAMIC THRESHOLD HERE
-                        # Ensure we don't include items already processed in this pass
                         if dist < merge_threshold and neighbor_id not in processed_ids:
                             cluster_ids.append(neighbor_id)
                             cluster_docs.append(results['documents'][0][j])
+                            meta = results['metadatas'][0][j] if results['metadatas'][0] else {}
+                            cluster_metas.append(meta)
                 
-                # 4. If a cluster is found (more than just the item itself)
+                # 4. If a cluster is found
                 if len(cluster_ids) > 1:
                     log_callback(f"Found cluster of {len(cluster_ids)} items:")
                     
-                    # Ask LLM to Merge
-                    merge_prompt = (
-                        "You are a memory optimizer. "
-                        "Combine the following list of similar learnings into ONE single, concise, comprehensive learning. "
-                        "Do not lose important details, but remove redundancy. "
-                        "Output JSON: {'topic': '...', 'learning': '...'}"
-                    )
-                    
+                    # --- CHANGED: Removed hardcoded prompt. The wrapper injects 'memory_consolidator' system prompt automatically. ---
                     facts_list = "\n".join([f"- {d}" for d in cluster_docs])
                     log_callback(f"Facts to merge:\n{facts_list}")
+                    
                     try:
+                        # We only send the HumanMessage. The SystemMessage is handled by the client wrapper based on Config.
                         messages = [
-                            SystemMessage(content=merge_prompt),
                             HumanMessage(content=f"Facts to merge:\n{facts_list}")
                         ]
                         
-                        # Handle HF Pipeline vs Standard Client vs Custom Wrappers
-                        if isinstance(analyzer, HuggingFacePipeline):
+                        if isinstance(consolidator, HuggingFacePipeline):
                              prompt_str = messages_to_string(messages)
-                             response_content = analyzer.invoke(prompt_str)
+                             response_content = consolidator.invoke(prompt_str)
                         else:
-                             response = analyzer.invoke(messages)
-                             # --- FIX START: Handle both String and Message objects ---
+                             response = consolidator.invoke(messages)
                              if isinstance(response, str):
                                  response_content = response
                              elif hasattr(response, 'content'):
                                  response_content = response.content
                              else:
                                  response_content = str(response)
-                             # --- FIX END ---
                         
-                        # Robust JSON parsing
+                        # Parsing Logic
                         try:
-                            # Clean potential markdown
                             cleaned_content = response_content.replace('```json', '').replace('```', '').strip()
-                            log_callback(f"LLM Merge Response: {cleaned_content}") 
                             data = json.loads(cleaned_content)
                         except json.JSONDecodeError:
-                            # Try finding JSON in text using regex
                             import re
                             match = re.search(r"\{.*\}", response_content, re.DOTALL)
                             if match:
@@ -1779,20 +2118,35 @@ class EpisodicMemoryManager:
                         new_learning = data.get('learning', '')
                         
                         if new_learning:
-                            # A. Delete old files/entries
-                            for old_id in cluster_ids:
-                                path = os.path.join(EPISODES_DIR, old_id)
+                            # A. Delete old files/entries (Includes File Deletion Fix)
+                            for idx, old_id in enumerate(cluster_ids):
+                                old_meta = cluster_metas[idx]
+                                filename_to_delete = old_id 
+                                
+                                if old_meta.get('source_file'):
+                                    filename_to_delete = old_meta['source_file']
+                                elif old_meta.get('filename'):
+                                    filename_to_delete = old_meta['filename']
+                                
+                                if not filename_to_delete.endswith('.json'):
+                                    filename_to_delete += '.json'
+
+                                path = os.path.join(EPISODES_DIR, filename_to_delete)
+                                
                                 if os.path.exists(path):
-                                    try: os.remove(path)
-                                    except: pass
-                                # Mark these IDs as processed so the outer loop skips them
+                                    try: 
+                                        os.remove(path)
+                                    except Exception as del_err:
+                                        log_callback(f"Error deleting {filename_to_delete}: {del_err}")
+                                else:
+                                    log_callback(f"File not found for deletion: {path}")
+                                
                                 processed_ids.add(old_id)
                             
                             # B. Delete from DB
                             self.collection.delete(ids=cluster_ids)
                             
                             # C. Create New Entry
-                            # Use a distinct prefix so we know it's a consolidated file
                             new_filename = f"merged_pass{pass_number}_{int(time.time())}_{merge_count}.json"
                             new_filepath = os.path.join(EPISODES_DIR, new_filename)
                             current_time = datetime.now().isoformat()
@@ -1801,16 +2155,22 @@ class EpisodicMemoryManager:
                                 "topic": new_topic,
                                 "learning": new_learning,
                                 "timestamp": current_time,
-                                "source_file": "consolidation_process"
+                                "source_file": new_filename
                             }
                             
                             with open(new_filepath, 'w', encoding='utf-8') as f:
                                 json.dump(record, f, indent=4)
                                 
                             doc_text = f"Topic: {new_topic}. Learning: {new_learning}"
+                            
                             self.collection.add(
                                 documents=[doc_text],
-                                metadatas=[{"topic": new_topic, "timestamp": current_time, "source_file": "consolidation"}],
+                                metadatas=[{
+                                    "topic": new_topic, 
+                                    "timestamp": current_time, 
+                                    "source_file": new_filename,
+                                    "type": "consolidated_memory"
+                                }],
                                 ids=[new_filename]
                             )
                             
@@ -1820,13 +2180,11 @@ class EpisodicMemoryManager:
                     except Exception as e:
                         log_callback(f"Error merging cluster: {e}")
                 else:
-                    # No similar items found for this ID, mark as processed
                     processed_ids.add(current_id)
 
-            # 5. End of Pass Check
             if merge_count == 0:
                 log_callback(f"Pass {pass_number}: 0 merges found. DB is optimized.")
-                break # Exit the while loop
+                break 
             
             log_callback(f"Pass {pass_number} finished with {merge_count} merges. Restarting scan...")
             pass_number += 1
@@ -1878,11 +2236,11 @@ class EpisodicMemoryManager:
 
             valid_memories = []
             
-            logger.info(f"--- {log_prefix} for: '{query[:50]}...' (Threshold: {THRESHOLD}) ---")
+            logger.info(f"--- {log_prefix} for: '{query[:200]}...' (Threshold: {THRESHOLD}) ---")
             
             for doc, dist in candidates:
                 # Log what we found for debugging
-                logger.info(f"  Found (Dist: {dist:.4f}): {doc[:60]}...")
+                logger.info(f"  Found (Dist: {dist:.4f}): {doc[:200]}...")
                 
                 if dist < THRESHOLD:
                     valid_memories.append(f"- {doc}")
@@ -2228,139 +2586,104 @@ class PromptHandler:
         return restored_history
 
 
-    def enhance_prompt(self, prompt, use_semantic_memory, use_chat_summaries = True, raw_query=None):
-        """
-        Enriches the prompt using metadata.
-        Args:
-            prompt: The full text (including context/files) for the LLM.
-            use_semantic_memory: Boolean flag.
-            raw_query: The specific user input (used for metadata generation).
-        """
-        # --- LOAD RETRIEVAL SETTINGS ---
+    def enhance_prompt(self, prompt, use_semantic_memory, use_chat_summaries=True, raw_query=None, doc_rag_manager=None, system_prompt=None):
+        """Enriches the prompt using metadata and Session-specific RAG (Structured List Version)."""
         retrieval_conf = LLM_CONFIG.get("retrieval", DEFAULT_CONFIG["retrieval"])
         rag_k_val = int(retrieval_conf.get("rag_k", 3))
         episodic_k_val = int(retrieval_conf.get("episodic_k", 12))
         summary_k_val = int(retrieval_conf.get("summary_k", 3))
 
-        # USE RAW QUERY FOR METADATA GENERATION
         text_for_metadata = raw_query if raw_query else prompt
-        
         prompt_metadata = enrich_prompt(text_for_metadata).get("metadata")
-        logger.info(f"Generated Metadata for prompt: {prompt_metadata}")
         
-        # 1. Retrieve Semantic Context (Existing FAISS Logic)
+        # --- 1. RECUPERO DATI RAG ---
+        search_text = raw_query if raw_query else prompt
+        doc_context = ""
+        if doc_rag_manager and doc_rag_manager.active_indices:
+            try:
+                doc_context = doc_rag_manager.query_active_files(search_text, k=5)
+            except Exception as e:
+                logger.error(f"Error in Doc RAG: {e}")
+
         rag_metadata = self.memory_manager.embedding_manager.retrieve_metadata_context(
             metadata=prompt_metadata, k=rag_k_val, current_chat_file=self.memory_manager.memory_file
         )
         
         context_text = ""
-        # Use raw_query for vector search to avoid noise from file contents
-        search_text = raw_query if raw_query else prompt
-        
         if use_semantic_memory and self.memory_manager.embedding_manager:
-            try:
-                # UPDATED: Use rag_k_val from settings
-                relevant_contexts = self.memory_manager.embedding_manager.retrieve_relevant_context(
-                    search_text, k=rag_k_val, current_chat_file=self.memory_manager.memory_file
-                )
-                if relevant_contexts:
-                    context_text = self.memory_manager.embedding_manager.format_retrieved_context(relevant_contexts)
-            except Exception as e:
-                logger.error(f"Error retrieving semantic memory: {e}")
+            relevant_contexts = self.memory_manager.embedding_manager.retrieve_relevant_context(
+                search_text, k=rag_k_val, current_chat_file=self.memory_manager.memory_file
+            )
+            if relevant_contexts:
+                context_text = self.memory_manager.embedding_manager.format_retrieved_context(relevant_contexts)
 
-        # 2. Retrieve Episodic Memory
         episodic_text = ""
         if use_semantic_memory and self.episodic_manager:
-            # UPDATED: Use episodic_k_val from settings
             episodic_text = self.episodic_manager.retrieve(search_text, n_results=episodic_k_val, target="episodes")
-            if episodic_text:
-                episodic_text = f"--- EPISODIC MEMORY (Past learnt lessons) ---\n{episodic_text}\n---\n"
 
-        # 3. Retrieve Chat Summaries
         summary_text = ""
         if use_chat_summaries and self.episodic_manager:
-            # UPDATED: Use summary_k_val from settings
             summary_text = self.episodic_manager.retrieve(search_text, n_results=summary_k_val, target="summary")
-            if summary_text:
-                summary_text = f"\n--- CONTEXTUALLY PERTINENT PAST CHATS SUMMARIZED ---\n{summary_text}\n---\n"
 
-        # 4. Construct Final Prompt
-        final_prompt_text = (
-            f"{episodic_text}\n"
-            f"{summary_text}\n"
-            f"{context_text}\n"
-            f"{rag_metadata}\n"
-            f"Task: considering the given past information, answer the user by continuing the following conversation: \n\n"
+        # --- 2. COSTRUZIONE DEL BLOCCO CONTESTO ---
+        full_context_block = (
+            "--- ADDITIONAL CONTEXT FROM YOUR LONG-TERM MEMORY ---\n"
+            f"RELEVANT DOCUMENTS: {doc_context if doc_context else 'None'}\n"
+            f"LEARNT LESSONS: {episodic_text if episodic_text else 'None'}\n"
+            f"PAST SUMMARIES: {summary_text if summary_text else 'None'}\n"
+            f"SEMANTIC MATCHES: {context_text if context_text else 'None'}\n"
+            f"METADATA: {rag_metadata if rag_metadata else 'None'}\n"
+            "--- END OF CONTEXT ---\n"
+            "\n\nUse the relevant parts of the context above to answer the user's last question. If the context doesn't contain the answer, rely on your general knowledge but mention it. ENSURE YOU ANSWER IN THE USER'S LANGUAGE.\n"
         )
         
-        # Store original user prompt in memory with metadata
-        msg = HumanMessage(content=raw_query if raw_query else prompt)
-        msg.additional_kwargs = prompt_metadata
-        self.memory_manager.add_message(msg)
+        # --- 3. AGGIORNAMENTO CRONOLOGIA ---
+        current_user_msg = HumanMessage(content=raw_query if raw_query else prompt)
+        current_user_msg.additional_kwargs = prompt_metadata
+        self.memory_manager.add_message(current_user_msg)
 
-        # Create message list for AI
-        ai_messages = []
-        system_prompt_added = False
+        # --- 4. COSTRUZIONE LISTA MESSAGGI STRUTTURATA (FIXATA) ---
+        structured_messages = [
+            
+            SystemMessage(content=system_prompt),
+            
+            # Indice 1: Il contesto RAG (DEVE essere un SystemMessage)
+            SystemMessage(content=full_context_block) 
+        ]
 
-        for msg in self.memory_manager.messages:
-            if isinstance(msg, SystemMessage) and not system_prompt_added:
-                ai_messages.append(msg)
-                system_prompt_added = True
-            elif not isinstance(msg, SystemMessage):
-                ai_messages.append(msg)
+        # Aggiungiamo tutta la cronologia corrente (User e AI)
+        for m in self.memory_manager.messages:
+            if not isinstance(m, SystemMessage):
+                structured_messages.append(m)
 
-        ai_messages=final_prompt_text + self.structure_chat_history(ai_messages)
-        print(ai_messages)
-        return ai_messages
+        return structured_messages
     
 
 
 
-    async def crew_prompt(self, prompt, callback=None, use_semantic_memory=True, raw_query=None):
-        # DYNAMICALLY GET CLIENT (Solves stale config issue)
-        client = get_llm_client("main", temp=0.7)
-        
-        if client is None:
-            error_msg = "LLM Client not available. Check Config."
-            if callback: 
-                callback(error_msg, role="assistant")
-                callback("", role=None)
-            return error_msg
-        
-        # Pass raw_query to enhance_prompt
-        ai_messages = self.enhance_prompt(prompt, use_semantic_memory, raw_query=raw_query)
+    async def crew_prompt(self, prompt, callback=None, use_semantic_memory=True, raw_query=None, doc_rag_manager=None):
+        client = get_llm_client("main")
+        if client is None: return "Error: No Client"
+        system_prompt = client.system_prompt if hasattr(client, 'system_prompt') else "IDENTITY_PLACEHOLDER"
+        # Pass the doc_rag_manager through
+        ai_messages = self.enhance_prompt(prompt, use_semantic_memory, raw_query=raw_query, doc_rag_manager=doc_rag_manager, system_prompt = system_prompt)
+        logger.info(f"Enhanced Prompt:\n{ai_messages}...\n--- END OF PROMPT ---")
 
         try:
             response_content = ""
-            
-            # USE UNIFIED STREAMING HERE (Solves HF vs Ollama issue)
             async for text in unified_astream(client, ai_messages):
                 if text:
                     response_content += text
-                    if callback:
-                        callback(text, role="assistant")
+                    if callback: callback(text, role="assistant")
 
             ai_message = AIMessage(content=response_content)
-            
             self.memory_manager.add_message(ai_message)
             self.memory_manager.save_memory()
-            
-            log_prompt = raw_query if raw_query else prompt
-            self.memory_manager.log_event("ai_response", {
-                "prompt": log_prompt[:100], 
-                "response_length": len(response_content),
-                "semantic_memory_used": use_semantic_memory,
-                "timestamp": datetime.now().isoformat()
-            })
-
             if callback: callback("", role=None)
             return response_content
         except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            logger.error(error_msg)
-            if callback: callback(error_msg, role="assistant")
-            if callback: callback("", role=None)
-            return error_msg
+            if callback: callback(f"Error: {e}", role="assistant")
+            return str(e)
         
         
     def save_memory(self):
@@ -2395,6 +2718,9 @@ class CrewChatUI:
         self.excel_sheets_data = None
         self.current_excel_path = None
         self.code_error = ""
+        self.attached_files_list = [] 
+        self.active_rag_files = set()
+        self.doc_rag_manager = DocumentRAGManager(embedding_manager.model)
         self.setup_ui()
         self.setup_file_menu()
         self.bind_events()
@@ -2434,18 +2760,22 @@ class CrewChatUI:
 
     # [All UI setup methods remain the same as original]
     # Abbreviated for space - includes setup_ui, setup_file_menu, upload/save methods, etc.
-    
+        
     def setup_file_menu(self):
-        """Setup file menu for different file formats."""
+        """Setup file menu using only the universal dragndrop functionality."""
         self.file_menu = tk.Menu(self.root, tearoff=0)
-        self.file_menu.add_command(label="Upload PDF", command=self.upload_pdf)
-        self.file_menu.add_command(label="Upload Excel", command=self.upload_excel)
-        self.file_menu.add_command(label="Upload Word", command=self.upload_word)
+        
+        # The new primary way to get files into the system
+        self.file_menu.add_command(label="Attach Files (Drag & Drop)", command=self.open_drag_drop_dialog)
         self.file_menu.add_separator()
+        
+        # Export functions remain
         self.file_menu.add_command(label="Save as PDF", command=self.save_as_pdf)
         self.file_menu.add_command(label="Save as Excel", command=self.save_as_excel)
         self.file_menu.add_command(label="Save as Word", command=self.save_as_word)
         self.file_menu.add_separator()
+        
+        # Analytics remains (will work if an Excel is among the attached files)
         self.file_menu.add_command(label="Excel Analytics", command=self.show_excel_analytics)
         self.root.config(menu=self.file_menu)
 
@@ -2592,45 +2922,62 @@ class CrewChatUI:
                 self._insert_formatted(f"Error processing Word file: {e}", role="assistant")
 
     def save_as_pdf(self):
-        """Save chat content as PDF."""
-        file_path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")])
-        if file_path:
-            text = self.get_chat_content()
-            write_to_pdf(text, file_path)
-            self._insert_formatted(f"Chat saved as PDF: {file_path}", role="assistant")
+        """Simulates 'Print to PDF' by converting a Word layout to PDF."""
+        if convert is None:
+            messagebox.showerror("Error", "Please install docx2pdf: pip install docx2pdf")
+            return
 
-    def save_as_excel(self):
-        """Enhanced Excel saving with structure preservation."""
-        file_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
-        if file_path:
+        file_path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")])
+        if not file_path:
+            return
+
+        # 1. Create a temporary Word file path
+        temp_word_path = file_path.replace(".pdf", "_temp.docx")
+        
+        self._start_loading_animation()
+        
+        def run_conversion():
             try:
-                if self.excel_sheets_data:
-                    write_to_excel_enhanced({"sheets": self.excel_sheets_data}, file_path)
-                    self._insert_formatted(f"Excel data saved with structure: {file_path}", role="assistant")
-                elif self.pending_dataframe is not None:
-                    self.pending_dataframe.to_excel(file_path, index=False)
-                    self._insert_formatted(f"DataFrame saved to {file_path}", role="assistant")
-                else:
-                    text = self.get_chat_content()
-                    write_to_excel(text, file_path)
-                    self._insert_formatted(f"Chat content saved as Excel: {file_path}", role="assistant")
+                # 2. Generate the high-quality Word file first
+                write_to_word(self.memory_manager.messages, temp_word_path)
+                
+                # 3. Use the system engine to convert Word to PDF (Retains emojis and layout)
+                # This requires Microsoft Word to be installed on the system
+                convert(temp_word_path, file_path)
+                
+                # 4. Cleanup temp file
+                if os.path.exists(temp_word_path):
+                    os.remove(temp_word_path)
+                    
+                self.root.after(0, lambda: self._insert_formatted(f"PDF Saved (via Print Simulation): {file_path}", role="system"))
             except Exception as e:
-                self._insert_formatted(f"Error saving Excel file: {e}", role="assistant")
+                logger.error(f"PDF Conversion failed: {e}")
+                self.root.after(0, lambda: messagebox.showerror("Conversion Error", f"Could not simulate PDF print. Make sure Word is installed. Error: {e}"))
+            finally:
+                self.root.after(0, self._stop_loading_animation)
+
+        threading.Thread(target=run_conversion, daemon=True).start()
 
     def save_as_word(self):
-        """Save chat content as Word."""
+        """Save chat content as Word using structured memory."""
         file_path = filedialog.asksaveasfilename(defaultextension=".docx", filetypes=[("Word files", "*.docx")])
         if file_path:
-            text = self.get_chat_content()
-            write_to_word(text, file_path)
-            self._insert_formatted(f"Chat saved as Word: {file_path}", role="assistant")
+            write_to_word(self.memory_manager.messages, file_path)
+            self._insert_formatted(f"Chat exported to Word: {file_path}", role="system")
 
-    def get_chat_content(self):
-        """Get the current chat content as text."""
-        self.chat_display.config(state="normal")
-        text = self.chat_display.get("1.0", "end-1c")
-        self.chat_display.config(state="disabled")
-        return text
+    def save_as_excel(self):
+        """Save chat content as Excel using structured memory."""
+        file_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
+        if file_path:
+            # Check if we are saving a data analysis result or just the chat
+            if self.pending_dataframe is not None:
+                self.pending_dataframe.to_excel(file_path, index=False)
+                self._insert_formatted(f"DataFrame saved to {file_path}", role="system")
+            else:
+                write_to_excel_structured(self.memory_manager.messages, file_path)
+                self._insert_formatted(f"Chat history exported to Excel: {file_path}", role="system")
+
+
 
     def show_file_menu(self):
         """Show the file menu."""
@@ -2792,8 +3139,18 @@ class CrewChatUI:
         )
         self.file_button.pack(side=tk.LEFT, padx=5)
         
-        # ... (Creative button is commented out in source, skipping) ...
 
+
+        self.btn_print_files = tk.Button(
+            self.command_frame,
+            text="Print Files",
+            command=self.print_file_list,
+            bg="#7f8c8d",
+            fg="#ffffff",
+            font=("Segoe UI", 9),
+            padx=10
+        )
+        self.btn_print_files.pack(side=tk.LEFT, padx=5)
         self.toggle_pin_button = tk.Button(
             self.command_frame,
             text="Pinned: OFF",
@@ -2851,6 +3208,174 @@ class CrewChatUI:
         self.loading_animation = False
         self.loading_dots = 0
         self.setup_text_tags()
+
+    def open_drag_drop_dialog(self):
+        """Opens the integrated manager that remembers files and allows RAG activation."""
+        # We pass the CURRENT lists so the window shows them immediately
+        dialog = MaiaAttachmentsDialog(self.root, self.attached_files_list, self.active_rag_files)
+        
+        # This stops the code here until the window is closed
+        self.root.wait_window(dialog)
+
+        # If user clicked Confirm, update the main app's state
+        if dialog.confirmed:
+            self.attached_files_list = dialog.attachments
+            self.active_rag_files = dialog.rag_active
+            
+            # 1. Handle RAG indexing if there are green files
+            if self.active_rag_files:
+                self._start_loading_animation()
+                threading.Thread(target=self._process_rag_embedding, daemon=True).start()
+            
+            # 2. Update the "Dump" context (files not in RAG are passed as raw text)
+            self._prepare_standard_context()
+
+    def _process_rag_embedding(self):
+        """Background thread to handle RAG folder indexing."""
+        for file_path in self.active_rag_files:
+            self.doc_rag_manager.embed_file(file_path)
+        
+        self.root.after(0, self._stop_loading_animation)
+        self.root.after(0, lambda: self._insert_formatted(f"RAG Activated for {len(self.active_rag_files)} files.", role="system"))
+
+
+    def _prepare_standard_context(self):
+        """Handles the standard 'file dump' for files not selected for RAG."""
+        all_content = ""
+        file_count = 0
+        
+        for path in self.attached_files_list:
+            # Skip files that are being handled by the RAG manager
+            if path in self.active_rag_files: 
+                continue 
+            
+            # INITIALIZE content to None at the start of every loop
+            content = None 
+            ext = os.path.splitext(path)[1].lower()
+            
+            try:
+                if ext == ".pdf":
+                    content = read_pdf(path)
+                elif ext == ".docx":
+                    content = read_word(path)
+                elif ext in [".xlsx", ".xls"]:
+                    res = read_excel_enhanced(path)
+                    content = res[0] if isinstance(res, tuple) else res
+                elif ext in [".py", ".txt", ".json", ".md", ".csv"]:
+                    with open(path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                
+                # Now 'content' is guaranteed to exist (either as a string or None)
+                if content and content.strip():
+                    all_content += f"\n\n--- ATTACHMENT: {os.path.basename(path)} ---\n"
+                    all_content += content
+                    file_count += 1
+            except Exception as e:
+                logger.error(f"Error reading {path} for standard context: {e}")
+
+        if all_content:
+            self.pending_file_content = all_content
+            self._insert_formatted(f"Standard context updated with {file_count} file(s).", role="system")
+        else:
+            self.pending_file_content = None
+
+
+    def open_rag_selection_ui(self):
+        """Window to manage attached files and activate RAG."""
+        rag_win = tk.Toplevel(self.root)
+        rag_win.title("Attached Files & RAG Manager")
+        rag_win.geometry("600x700")
+        rag_win.configure(bg="#1e1e1e")
+
+        tk.Label(rag_win, text="ATTACHED FILES", bg="#1e1e1e", fg="#4ea1ff", font=("Arial", 12, "bold")).pack(pady=10)
+        tk.Label(rag_win, text="Click a file to toggle 'Activate RAG' (Green = Selected)", 
+                 bg="#1e1e1e", fg="#aaaaaa", font=("Arial", 9, "italic")).pack()
+
+        # Scrollable area for file buttons
+        container = tk.Frame(rag_win, bg="#1e1e1e")
+        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        canvas = tk.Canvas(container, bg="#1e1e1e", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg="#1e1e1e")
+
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw", width=540)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Draw buttons for all persistent files
+        for file_path in self.attached_files_list:
+            fname = os.path.basename(file_path)
+            
+            # Use green background if file is already active
+            initial_bg = "#27ae60" if file_path in self.active_rag_files else "#34495e"
+            
+            btn = tk.Button(scroll_frame, text=fname, bg=initial_bg, fg="white", 
+                            font=("Segoe UI", 10), anchor="w", padx=10, pady=8, relief="flat")
+            
+            def toggle(p=file_path, b=btn):
+                if p in self.active_rag_files:
+                    self.active_rag_files.remove(p)
+                    b.config(bg="#34495e")
+                else:
+                    self.active_rag_files.add(p)
+                    b.config(bg="#27ae60") # GREEN BACKGROUND when selected
+
+            btn.config(command=toggle)
+            btn.pack(fill=tk.X, pady=2)
+
+        def confirm_and_embed():
+            rag_win.destroy()
+            if not self.active_rag_files:
+                self._insert_formatted("No files selected for RAG. Files remain attached as raw context.", role="system")
+                return
+
+            self._start_loading_animation()
+            self._insert_formatted(f"Indexing {len(self.active_rag_files)} files for RAG...", role="system")
+            
+            def background_work():
+                # Clear manager and rebuild only selected files
+                self.doc_rag_manager.active_indices = {}
+                for f in self.active_rag_files:
+                    try:
+                        self.doc_rag_manager.embed_file(f)
+                    except Exception as e:
+                        logger.error(f"Error embedding {f}: {e}")
+                
+                self.root.after(0, self._stop_loading_animation)
+                self.root.after(0, lambda: self._insert_formatted("RAG Activated. These files will now be searched semantically.", role="system"))
+
+            threading.Thread(target=background_work, daemon=True).start()
+
+        # Bottom Buttons
+        btn_frame = tk.Frame(rag_win, bg="#1e1e1e")
+        btn_frame.pack(fill=tk.X, pady=20, padx=20)
+
+        tk.Button(btn_frame, text="Add More Files", command=lambda: [rag_win.destroy(), self.open_drag_drop_dialog()],
+                  bg="#3498db", fg="white", font=("Arial", 10, "bold"), width=15).pack(side=tk.LEFT)
+        
+        tk.Button(btn_frame, text="ACTIVATE RAG", command=confirm_and_embed,
+                  bg="#2ecc71", fg="white", font=("Arial", 10, "bold"), width=25).pack(side=tk.RIGHT)
+
+    def print_file_list(self):
+        """Prints the list of currently attached files to console and chat."""
+        if not self.attached_files_list:
+            print("No files attached.")
+            self._insert_formatted("No files currently in memory.", role="system")
+            return
+
+        print("-" * 30)
+        print(f"Attached Files ({len(self.attached_files_list)}):")
+        msg = "Current Files:\n"
+        for f in self.attached_files_list:
+            print(f)
+            msg += f"- {os.path.basename(f)}\n"
+        print("-" * 30)
+        self._insert_formatted(msg, role="system")
+
 
 
     def open_creative_mode(self):
@@ -3154,14 +3679,14 @@ if __name__ == "__main__":
             self._normal_process_async(prompt, raw_prompt)
 
     def _normal_process_async(self, prompt, raw_prompt):
-        """Process a normal prompt with semantic memory"""
         try:
             asyncio.run(
                 self.prompthandler.crew_prompt(
                     prompt, 
                     callback=self._normal_stream_response, 
                     use_semantic_memory=True,
-                    raw_query=raw_prompt # Pass the specific user query
+                    raw_query=raw_prompt,
+                    doc_rag_manager=self.doc_rag_manager 
                 )
             )
         except Exception as e:
@@ -3184,12 +3709,84 @@ if __name__ == "__main__":
                 timestamp = datetime.now().strftime("%H:%M")
                 self.chat_display.config(state="normal")
                 self._insert_formatted(f"\n[{timestamp}]", role="system")
-                self._insert_formatted(f"M.A.I.A.: ", role="assistant")
+                #self._insert_formatted(f"M.A.I.A.: ", role="assistant")
                 self.chat_display.config(state="disabled")
                 self.prefix_added = True
             self._stream_text_only(response_text)
 
+    def process_file_list(self, files):
+        """Centralized logic to process a list of files and append to memory."""
+        if not files:
+            return
 
+        processed_text = ""
+        file_count = 0
+        self._start_loading_animation()
+
+        try:
+            for file_path in files:
+                file_path = os.path.normpath(file_path)
+                if not os.path.exists(file_path): continue
+                
+                # Update the tracked file list
+                if file_path not in self.attached_files_list:
+                    self.attached_files_list.append(file_path)
+                
+                ext = os.path.splitext(file_path)[1].lower()
+                content = None
+
+                if ext == ".pdf":
+                    content = read_pdf(file_path)
+                elif ext == ".docx":
+                    content = read_word(file_path)
+                elif ext in [".xlsx", ".xls"]:
+                    res = read_excel_enhanced(file_path)
+                    if isinstance(res, tuple):
+                        content = res[0]
+                        if not self.excel_structure: self.excel_structure = res[1]
+                        if not self.excel_sheets_data: self.excel_sheets_data = res[2]
+                        self.current_excel_path = file_path
+                    else:
+                        content = res
+                elif ext in [".py", ".txt", ".json", ".md", ".csv"]:
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                    except Exception as e:
+                        logger.error(f"Error reading text file: {e}")
+
+                if content:
+                    processed_text += f"\n\n--- ATTACHMENT: {os.path.basename(file_path)} ---\n"
+                    processed_text += content
+                    file_count += 1
+            
+            if processed_text:
+                if self.pending_file_content:
+                    self.pending_file_content += processed_text
+                else:
+                    self.pending_file_content = processed_text
+                
+                self._insert_formatted(f"Attached {file_count} file(s) to next prompt.", role="system")
+            
+        except Exception as e:
+            self._insert_formatted(f"Error processing files: {e}", role="assistant")
+        finally:
+            self._stop_loading_animation()
+
+
+
+    # Now we simplify the individual uploaders to use the new logic:
+    def upload_pdf(self):
+        file_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
+        if file_path: self.process_file_list([file_path])
+
+    def upload_excel(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
+        if file_path: self.process_file_list([file_path])
+
+    def upload_word(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Word files", "*.docx")])
+        if file_path: self.process_file_list([file_path])
 
     def _google_search_async(self, query, last_response="", last_question=""):
         """Perform Google search asynchronously"""
@@ -3473,7 +4070,7 @@ class RouterAgent:
         pass
 
     async def route(self, prompt: str, last_response: str = "") -> str:
-        client = get_llm_client("router", temp=0)
+        client = get_llm_client("router")
         if client is None: return "normalprompt"
         
         logger.info(f"Routing prompt: {prompt}")
@@ -3499,7 +4096,7 @@ class QueryRefinerAgent:
         pass
 
     async def refine_query(self, prompt: str, last_response="", last_question="") -> str:
-        client = get_llm_client("refiner", temp=0.2)
+        client = get_llm_client("refiner")
         if client is None: return prompt
         
         logger.info(f"Refining query: {prompt}")
@@ -3520,7 +4117,7 @@ class CodingAgent:
         pass
 
     async def generate_code(self, prompt: str, last_response="", last_question="", file_path="", sample_data="", error_msg="") -> str:
-        client = get_llm_client("coder", temp=0.2)
+        client = get_llm_client("coder")
         if client is None: return prompt
         
         logger.info(f"Generating code for prompt: {prompt}")
@@ -3560,7 +4157,7 @@ class SummaryRAG:
         )
 
         # 3. Initialize LLM
-        self.llm = get_llm_client("summarizer", temp=0)
+        self.llm = get_llm_client("summarizer")
         
         # --- FIX: Disable System Prompt Override ---
         # We manually clear the wrapper's system prompt so it respects the 
@@ -4259,14 +4856,14 @@ def open_custom_llm_ui(root_window):
     scrollbar.pack(side="right", fill="y", pady=(0, 60)) 
     canvas.pack(side="left", fill="both", expand=True, pady=(0, 60))
 
-    components = ["main", "router", "refiner", "coder", "summarizer", "memory_analyzer"]
+    components = ["main", "router", "refiner", "coder", "summarizer", "memory_analyzer", "memory_consolidator"]
     
     for comp in components:
         frame = tk.Frame(scrollable_frame, bg="#1e1e1e", pady=5, padx=10)
         frame.pack(fill=tk.X)
         
         lbl_text = comp.replace("_", " ").title()
-        tk.Label(frame, text=lbl_text, bg="#1e1e1e", fg="#aaaaaa", width=15, anchor="w").pack(side=tk.LEFT)
+        tk.Label(frame, text=lbl_text, bg="#1e1e1e", fg="#aaaaaa", width=30, anchor="w").pack(side=tk.LEFT)
         
         curr = LLM_CONFIG.get(comp, DEFAULT_CONFIG.get("main"))
         status = f"{curr.get('provider', 'ollama')} : {curr.get('model', 'default')}"
@@ -4448,7 +5045,7 @@ def configure_component(component, parent_win):
 
 def select_or_new_chat():
     """Dialog to select existing chat, create new one, restore memory, or configure LLMs."""
-    root = tk.Tk()
+    root = TkinterDnD.Tk()
     root.title("M.A.I.A. Start")
     root.configure(bg="#1e1e1e")
     root.geometry("650x450") # Increased height
@@ -4523,7 +5120,7 @@ def main():
         refiner = QueryRefinerAgent()
         coder = CodingAgent()
         
-        root = tk.Tk()
+        root = TkinterDnD.Tk()
         app = CrewChatUI(root, router, refiner, coder, memory_manager, embedding_manager, prompthandler, episodic_manager)
 
         def on_closing():

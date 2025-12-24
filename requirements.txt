@@ -22,4 +22,4 @@ snac
 soundfile
 tkinterdnd2
 demoji
-pip install docx2pdf
+docx2pdf

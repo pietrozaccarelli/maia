@@ -37,7 +37,6 @@ from wordtyper import writeword
 import trafilatura
 import requests
 import faiss
-from sentence_transformers import SentenceTransformer
 from embedder import inquire
 from codeduo import codeduo
 from metadata_creator import enrich_prompt
@@ -50,7 +49,7 @@ from datetime import date
 import chromadb
 from chromadb.utils import embedding_functions
 from tkinterdnd2 import TkinterDnD, DND_FILES 
-from dragndrop import dragndrop 
+
 from langchain_core.prompts import ChatPromptTemplate
 try:
     from langchain_core.messages import HumanMessage, AIMessage, SystemMessage    
@@ -253,24 +252,30 @@ DEFAULT_CONFIG = {
         "temperature": 0.1, "max_tokens": 2048, "top_p": 0.5, "api_key": "",
         "system_prompt": DEFAULT_MEMORY_ANALIZER_PROMPT
     },
-        "memory_consolidator": {
+    "memory_consolidator": {
         "provider": "ollama", "model": DEFAULT_MODEL, 
         "temperature": 0.1, "max_tokens": 2048, "top_p": 0.5, "api_key": "",
         "system_prompt": DEFAULT_CONSOLIDATOR_PROMPT
     },
-        "retrieval": {
+         "directories": {
+        "hf_home": "",       # Path for HuggingFace models
+        "ollama_models": ""  # Path for Ollama models
+    },
+    "retrieval": {
         "rag_k": 3,
         "episodic_k": 12,
         "summary_k": 3,
-        "google_k": 5,           # Passed to inquire(num_links=...)
-        "relevance_threshold": 2.0,  # Max distance for retrieval (lower = stricter)
-        "consolidation_threshold": 0.8, # Max distance for merging memories
+        "google_k": 5,           
+        "relevance_threshold": 2.0,  
+        "consolidation_threshold": 0.8, 
         "max_history": 1000,
-        "topic_truncation": 100,      # Controls metadata context length
-        "semantic_truncation": 600    # Controls main RAG context length
+        "topic_truncation": 100,      
+        "semantic_truncation": 600,
+        "doc_rag_k": 5,             
+        "doc_rag_threshold": 2.0     
     }
-    
 }
+
 
 # Global Config Variable
 LLM_CONFIG = DEFAULT_CONFIG
@@ -284,7 +289,7 @@ def load_config():
         try:
             with open(CONFIG_FILE, "r") as f:
                 loaded = json.load(f)
-                # Merge with default to ensure new keys exist if loading old config
+                # Merge with default to ensure new keys exist
                 for key, val in DEFAULT_CONFIG.items():
                     if key not in loaded:
                         loaded[key] = val
@@ -298,6 +303,23 @@ def load_config():
             LLM_CONFIG = DEFAULT_CONFIG
     else:
         LLM_CONFIG = DEFAULT_CONFIG
+
+    # --- APPLY DIRECTORY SETTINGS TO ENVIRONMENT ---
+    dirs = LLM_CONFIG.get("directories", {})
+    
+    # 1. HuggingFace: Sets where transformers downloads/loads models
+    if dirs.get("hf_home") and os.path.isdir(dirs["hf_home"]):
+        os.environ["HF_HOME"] = dirs["hf_home"]
+        # Also set older vars just in case
+        os.environ["TRANSFORMERS_CACHE"] = dirs["hf_home"]
+        logger.info(f"HF_HOME set to: {dirs['hf_home']}")
+
+    # 2. Ollama: Sets where Ollama stores models
+    # Note: If Ollama is running as a system service, this might require a service restart
+    if dirs.get("ollama_models") and os.path.isdir(dirs["ollama_models"]):
+        os.environ["OLLAMA_MODELS"] = dirs["ollama_models"]
+        logger.info(f"OLLAMA_MODELS set to: {dirs['ollama_models']}")
+        
     return LLM_CONFIG
 
 def save_config(config):
@@ -391,11 +413,23 @@ class DocumentRAGManager:
             
         self.active_indices[file_path] = (index, chunks)
 
-    def query_active_files(self, query, k=5):
+    def query_active_files(self, query, k=None): # k is optional now, defaults to config
         """Searches only the files selected by the user."""
+        
+        # --- NEW: Get settings from Config ---
+        retrieval_conf = LLM_CONFIG.get("retrieval", DEFAULT_CONFIG["retrieval"])
+        
+        # Use config if k is not explicitly passed (or override if you prefer config always)
+        if k is None:
+            k = int(retrieval_conf.get("doc_rag_k", 5))
+            
+        threshold = float(retrieval_conf.get("doc_rag_threshold", 2.0))
+        # -------------------------------------
+
         context = ""
         for file_path, (index, chunks) in self.active_indices.items():
-            results = query_index(query, chunks, index, k=k)
+            # Pass the threshold to query_index
+            results = query_index(query, chunks, index, k=k, threshold=threshold)
             if results:
                 context += f"\n--- FROM DOCUMENT: {os.path.basename(file_path)} ---\n"
                 context += "\n".join(results) + "\n"
@@ -409,7 +443,7 @@ class MaiaAttachmentsDialog(tk.Toplevel):
     def __init__(self, master, existing_files, existing_rag):
         super().__init__(master)
         self.title("M.A.I.A. Attachments & RAG Manager")
-        self.geometry("700x550")
+        self.geometry("1400x1100")
         self.configure(bg="#1e1e1e")
 
         # PERSISTENCE LOGIC
@@ -541,19 +575,239 @@ class MaiaAttachmentsDialog(tk.Toplevel):
         self.destroy()
 
 
+
+# ==========================================
+#       MODEL MEMORY MANAGEMENT
+# ==========================================
+
+def get_ollama_loaded_models():
+    """
+    Queries the Ollama API to see what is actually loaded in VRAM.
+    Returns a list of normalized model names.
+    """
+    try:
+        response = requests.get("http://localhost:11434/api/ps", timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            # Extract model names (e.g., 'gemma2:latest')
+            # We strip the tag if the config doesn't use it, but keeping exact match is safer
+            models = [m.get('name', '') for m in data.get('models', [])]
+            return models
+    except Exception:
+        return []
+    return []
+
+def unload_specific_model(provider, model_name):
+    """
+    Unloads a specific model based on provider type.
+    Returns string message describing result and success status (bool).
+    """
+    import gc
+    import requests
+    
+    provider = provider.lower()
+    
+    # --- HUGGINGFACE LOGIC ---
+    if provider == "huggingface":
+        global LOADED_HF_PIPELINES
+        if model_name in LOADED_HF_PIPELINES:
+            del LOADED_HF_PIPELINES[model_name]
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+            except:
+                pass
+            return f"Unloaded HF Model: {model_name}", True
+        else:
+            return f"HF Model {model_name} was not in memory.", False
+
+    # --- OLLAMA LOGIC ---
+    elif provider == "ollama":
+        try:
+            # Send keep_alive=0 to force unload immediately
+            requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": model_name, "keep_alive": 0},
+                timeout=2
+            )
+            return f"Unload signal sent to Ollama for: {model_name}", True
+        except Exception as e:
+            return f"Ollama Error: {e}", False
+
+    # --- CLOUD/API LOGIC ---
+    else:
+        return f"Provider '{provider}' is cloud-based. No local RAM to free.", False
+
+def open_unload_selector(parent_win):
+    """
+    UI to view loaded models grouped by instance and unload them.
+    Shows which components (main, coder, etc.) use which model.
+    """
+    win = tk.Toplevel(parent_win)
+    win.title("Active Model Memory Manager")
+    win.geometry("2000x1200") 
+    win.configure(bg="#1e1e1e")
+
+    # Header
+    header_frame = tk.Frame(win, bg="#1e1e1e")
+    header_frame.pack(fill="x", pady=15, padx=20)
+    
+    tk.Label(header_frame, text="Memory Manager", 
+             bg="#1e1e1e", fg="white", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+    tk.Label(header_frame, text="View active models, see where they are used, and unload them to free RAM/VRAM.", 
+             bg="#1e1e1e", fg="#aaaaaa", font=("Segoe UI", 10)).pack(anchor="w")
+
+    # --- 1. GATHER DATA ---
+    # We want to group by unique (Provider, ModelName) tuples
+    # Structure: { "ollama::gemma2": { "provider": "ollama", "name": "gemma2", "components": ["main", "coder"] } }
+    
+    model_map = {}
+    
+    # --- DYNAMIC COMPONENT DISCOVERY ---
+    # Find all keys in the config that look like an LLM component
+    components_list = [
+        key for key, value in LLM_CONFIG.items() 
+        if isinstance(value, dict) and "provider" in value and "model" in value
+    ]
+    # -------------------------------------
+
+    for comp in components_list:
+        conf = LLM_CONFIG.get(comp, DEFAULT_CONFIG.get("main", {}))
+        provider = conf.get("provider", "ollama").lower()
+        model = conf.get("model", "default")
+        
+        # Create unique key
+        key = f"{provider}::{model}"
+        
+        if key not in model_map:
+            model_map[key] = {
+                "provider": provider,
+                "name": model,
+                "components": []
+            }
+        model_map[key]["components"].append(comp.upper())
+
+    # Fetch actual status
+    ollama_loaded = get_ollama_loaded_models() # List of strings
+    
+    # --- 2. BUILD UI ---
+    container = tk.Frame(win, bg="#1e1e1e")
+    container.pack(fill="both", expand=True, padx=20, pady=10)
+
+    # Scrollbar setup
+    canvas = tk.Canvas(container, bg="#1e1e1e", highlightthickness=0)
+    scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas, bg="#1e1e1e")
+
+    scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    frame_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    
+    def on_canvas_configure(event):
+        canvas.itemconfig(frame_id, width=event.width)
+    canvas.bind("<Configure>", on_canvas_configure)
+
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    # --- Headers ---
+    cols_frame = tk.Frame(scrollable_frame, bg="#2d2d2d", pady=10)
+    cols_frame.pack(fill="x", pady=(0, 5))
+    
+    tk.Label(cols_frame, text="MODEL NAME", bg="#2d2d2d", fg="#4ea1ff", font=("Segoe UI", 10, "bold"), width=25, anchor="w").pack(side="left", padx=10)
+    tk.Label(cols_frame, text="PROVIDER", bg="#2d2d2d", fg="#4ea1ff", font=("Segoe UI", 10, "bold"), width=15, anchor="w").pack(side="left", padx=10)
+    tk.Label(cols_frame, text="USED BY TASKS", bg="#2d2d2d", fg="#4ea1ff", font=("Segoe UI", 10, "bold"), width=30, anchor="w").pack(side="left", padx=10)
+    tk.Label(cols_frame, text="STATUS", bg="#2d2d2d", fg="#4ea1ff", font=("Segoe UI", 10, "bold"), width=15, anchor="w").pack(side="left", padx=10)
+    tk.Label(cols_frame, text="ACTION", bg="#2d2d2d", fg="#4ea1ff", font=("Segoe UI", 10, "bold"), width=15, anchor="e").pack(side="right", padx=20)
+
+    # --- Rows ---
+    for key, data in model_map.items():
+        prov = data["provider"]
+        name = data["name"]
+        comps = ", ".join(data["components"])
+        
+        # Determine Status
+        is_loaded = False
+        is_cloud = False
+        
+        if prov == "huggingface":
+            if name in LOADED_HF_PIPELINES:
+                is_loaded = True
+        elif prov == "ollama":
+            # Simple fuzzy check: if config name is in the 'ps' name (e.g. 'gemma2' in 'gemma2:latest')
+            for active in ollama_loaded:
+                if name in active:
+                    is_loaded = True
+                    break
+        elif prov in ["openai", "anthropic", "azure", "mistral", "gemini"]:
+            is_cloud = True
+
+        # UI Row
+        row = tk.Frame(scrollable_frame, bg="#252525", pady=15, padx=5)
+        row.pack(fill="x", pady=2)
+
+        # 1. Name
+        tk.Label(row, text=name, bg="#252525", fg="white", font=("Segoe UI", 10, "bold"), width=25, anchor="w").pack(side="left", padx=10)
+        
+        # 2. Provider
+        tk.Label(row, text=prov.upper(), bg="#252525", fg="#cccccc", width=15, anchor="w").pack(side="left", padx=10)
+        
+        # 3. Components
+        tk.Label(row, text=comps, bg="#252525", fg="#aaaaaa", width=30, anchor="w", wraplength=300, justify="left").pack(side="left", padx=10)
+
+        # 4. Status Label
+        status_text = "CLOUD" if is_cloud else ("LOADED (Active)" if is_loaded else "Unloaded")
+        status_fg = "#3498db" if is_cloud else ("#2ecc71" if is_loaded else "#7f8c8d")
+        
+        lbl_status = tk.Label(row, text=status_text, bg="#252525", fg=status_fg, font=("Segoe UI", 9, "bold"), width=15, anchor="w")
+        lbl_status.pack(side="left", padx=10)
+
+        # 5. Action Button
+        btn_state = "normal" if (is_loaded and not is_cloud) else "disabled"
+        btn_bg = "#e74c3c" if (is_loaded and not is_cloud) else "#444444"
+        btn_txt = "UNLOAD NOW"
+        
+        # Define button command with closure to capture variables
+        def perform_unload(p=prov, m=name, lbl=lbl_status, btn_ref=None):
+            msg, success = unload_specific_model(p, m)
+            if success:
+                lbl.config(text="Unloaded", fg="#7f8c8d")
+                if btn_ref:
+                    btn_ref.config(state="disabled", bg="#444444")
+                messagebox.showinfo("Unload Result", msg)
+            else:
+                messagebox.showerror("Error", msg)
+
+        btn = tk.Button(row, text=btn_txt, state=btn_state, bg=btn_bg, fg="white",
+                        font=("Segoe UI", 9, "bold"), width=15)
+        
+        # Configure command to pass the button reference itself
+        btn.config(command=lambda p=prov, m=name, l=lbl_status, b=btn: perform_unload(p, m, l, b))
+        btn.pack(side="right", padx=10)
+
+    # Footer
+    tk.Button(win, text="Close", command=win.destroy, bg="#34495e", fg="white", width=20, pady=5).pack(pady=15)
+
 # ==========================================
 #       MODULAR LLM ARCHITECTURE
 # ==========================================
 
 class UniversalLLMWrapper:
     """Base class defining the interface for all providers."""
-    def __init__(self, model, temperature=0.7, max_tokens=1024, top_p=0.9, api_key=None, system_prompt=None):
+    def __init__(self, model, temperature=0.7, max_tokens=1024, top_p=0.9, api_key=None, system_prompt=None, endpoint=None, api_version=None):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.api_key = api_key
         self.system_prompt = system_prompt
+        self.endpoint = endpoint
+        self.api_version = api_version 
         self.client = self._setup_client()
 
     def _setup_client(self):
@@ -595,22 +849,48 @@ class UniversalLLMWrapper:
 
 class OllamaWrapper(UniversalLLMWrapper):
     def _setup_client(self):
+        # Default local endpoint if none provided
+        base_url = self.endpoint if self.endpoint and self.endpoint.strip() else "http://localhost:11434"
+        
+        # --- FIX: Sanitize URL to prevent double-slash 404 errors ---
+        base_url = base_url.rstrip("/")
+        
+        # Prepare headers
+        headers = {}
+        if self.api_key and self.api_key.strip():
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["X-API-Key"] = self.api_key
+
         return ChatOllama(
             model=self.model,
             temperature=self.temperature,
             num_ctx=4096, 
             top_p=self.top_p,
+            base_url=base_url,
+            headers=headers 
         )
 
     async def astream(self, messages):
         final_msgs = self._prepare_messages(messages)
-        async for chunk in self.client.astream(final_msgs):
-            yield chunk.content
+        try:
+            async for chunk in self.client.astream(final_msgs):
+                yield chunk.content
+        except Exception as e:
+            # Catch 404 specifically to give helpful advice
+            if "404" in str(e):
+                yield f"[Error: Ollama returned 404. Cause: Model '{self.model}' not found OR Invalid Endpoint. Try running 'ollama pull {self.model}' in your terminal.]"
+            else:
+                yield f"[Error: {str(e)}]"
 
     def invoke(self, messages):
         final_msgs = self._prepare_messages(messages)
-        response = self.client.invoke(final_msgs)
-        return response.content
+        try:
+            response = self.client.invoke(final_msgs)
+            return response.content
+        except Exception as e:
+            if "404" in str(e):
+                return f"[Error: Ollama returned 404. Cause: Model '{self.model}' not found OR Invalid Endpoint. Try running 'ollama pull {self.model}' in your terminal.]"
+            return f"[Error: {str(e)}]"
 
 class OpenAIWrapper(UniversalLLMWrapper):
     def _setup_client(self):
@@ -691,22 +971,30 @@ class AzureOpenAIWrapper(UniversalLLMWrapper):
         if not AzureChatOpenAI: 
             raise ImportError("langchain_openai missing. Pip install langchain-openai")
 
-        # Logic to extract Endpoint and Key from the single "api_key" field
-        # Expected format in UI: "https://my-endpoint.com/|MY_API_KEY"
-        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
-        key = self.api_key
+        # 1. Endpoint Logic
+        endpoint = self.endpoint
+        if not endpoint or not endpoint.strip():
+            endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
 
-        if "|" in self.api_key:
-            parts = self.api_key.split("|", 1)
+        # Legacy Fallback for "ENDPOINT|KEY"
+        key = self.api_key
+        if (not endpoint or not endpoint.strip()) and "|" in key:
+            parts = key.split("|", 1)
             endpoint = parts[0].strip()
             key = parts[1].strip()
 
         if not endpoint:
-            raise ValueError("Azure requires an Endpoint. Please enter 'ENDPOINT|KEY' in the API Key field.")
+            raise ValueError("Azure requires an Endpoint URL.")
+
+        # 2. API Version Logic
+        # Use configured version, or default to stable 2023-05-15 if empty
+        current_api_version = self.api_version
+        if not current_api_version or not current_api_version.strip():
+            current_api_version = "2023-05-15"
 
         return AzureChatOpenAI(
-            azure_deployment=self.model, # In Azure, 'model' refers to the Deployment Name
-            openai_api_version="2023-05-15", # Default stable version
+            azure_deployment=self.model,
+            openai_api_version=current_api_version, # Dynamic Version
             azure_endpoint=endpoint,
             api_key=key,
             temperature=self.temperature,
@@ -734,13 +1022,27 @@ class LocalHFWrapper(UniversalLLMWrapper):
             return LOADED_HF_PIPELINES[self.model]
 
         logger.info(f"Loading HF Model: {self.model}...")
+        
+        # Retrieve custom cache directory
+        custom_cache = LLM_CONFIG.get("directories", {}).get("hf_home", "")
+        if not custom_cache or not os.path.isdir(custom_cache):
+            custom_cache = None # Fallback to default if invalid
+
         try:
-            tokenizer = AutoTokenizer.from_pretrained(self.model)
+            # Pass cache_dir to tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model, 
+                cache_dir=custom_cache
+            )
             if tokenizer.pad_token_id is None:
                 tokenizer.pad_token_id = tokenizer.eos_token_id
 
+            # Pass cache_dir to model
             model = AutoModelForCausalLM.from_pretrained(
-                self.model, torch_dtype="auto", device_map="auto"
+                self.model, 
+                torch_dtype="auto", 
+                device_map="auto",
+                cache_dir=custom_cache
             )
             
             pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
@@ -751,12 +1053,27 @@ class LocalHFWrapper(UniversalLLMWrapper):
             raise e
 
     async def astream(self, messages):
-        final_msgs = self._prepare_messages(messages)
-        prompt_text = messages_to_string(final_msgs)
+        # 1. CONVERT LangChain messages to a list of dicts
+        formatted_messages = []
+        for m in messages:
+            if isinstance(m, SystemMessage): role = "system"
+            elif isinstance(m, HumanMessage): role = "user"
+            else: role = "assistant"
+            formatted_messages.append({"role": role, "content": m.content})
+
+        # 2. APPLY THE CHAT TEMPLATE (This adds the <|im_start|> and <|im_end|> tags)
+        prompt_text = self.client.tokenizer.apply_chat_template(
+            formatted_messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+
+        # 3. SET UP THE STREAMER
         tokenizer = self.client.tokenizer
-        
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         
+        # 4. DEFINE GENERATION PARAMETERS
+        # We must explicitly tell the model that <|im_end|> or <|endoftext|> means STOP
         generation_kwargs = {
             "text_inputs": prompt_text,
             "max_new_tokens": self.max_tokens,
@@ -765,26 +1082,48 @@ class LocalHFWrapper(UniversalLLMWrapper):
             "do_sample": True if self.temperature > 0 else False,
             "streamer": streamer,
             "return_full_text": False,
-            "eos_token_id": tokenizer.eos_token_id 
+            # Ensure the model stops at the official End-of-Turn token
+            "eos_token_id": tokenizer.eos_token_id, 
+            "pad_token_id": tokenizer.pad_token_id
         }
 
+        # 5. START GENERATION IN A THREAD
         thread = Thread(target=self.client, kwargs=generation_kwargs)
         thread.start()
 
+        # 6. YIELD CHUNKS BUT WATCH FOR HALLUCINATED "USER:" HEADERS
         for new_text in streamer:
+            # Safety break: If the model ignores the EOS token and 
+            # starts writing "User:" manually, cut it off.
+            if "User:" in new_text or "--- END OF RESPONSE ---" in new_text:
+                break
             yield new_text
+            
         thread.join()
 
+    
     def invoke(self, messages):
-        final_msgs = self._prepare_messages(messages)
-        prompt_text = messages_to_string(final_msgs)
+        # Convert LangChain messages to standard dicts
+        formatted_messages = []
+        for m in messages:
+            if isinstance(m, SystemMessage): role = "system"
+            elif isinstance(m, HumanMessage): role = "user"
+            else: role = "assistant"
+            formatted_messages.append({"role": role, "content": m.content})
+
+        # Use the tokenizer's official template!
+        prompt_text = self.client.tokenizer.apply_chat_template(
+            formatted_messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        # Now run the model with the proper stop token
         result = self.client(
             prompt_text, 
             max_new_tokens=self.max_tokens, 
             temperature=self.temperature,
-            top_p=self.top_p,
-            do_sample=True if self.temperature > 0 else False,
-            return_full_text=False
+            stop_strings=["<|im_end|>", "<|endoftext|>"] # Tell it where to stop!
         )
         return result[0]['generated_text']
 
@@ -801,6 +1140,10 @@ def get_universal_client(component_name: str) -> UniversalLLMWrapper:
     api_key = config.get("api_key", "")
     system_prompt = config.get("system_prompt", "")
     
+    # --- NEW: Read Endpoint ---
+    endpoint = config.get("endpoint", "") 
+    # --------------------------
+    api_version = config.get("api_version", "")
     temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 1024)
     top_p = config.get("top_p", 0.9)
@@ -822,7 +1165,9 @@ def get_universal_client(component_name: str) -> UniversalLLMWrapper:
         return wrapper_class(
             model=model, temperature=temperature, 
             max_tokens=max_tokens, top_p=top_p, 
-            api_key=api_key, system_prompt=system_prompt
+            api_key=api_key, system_prompt=system_prompt,
+            endpoint=endpoint,
+            api_version=api_version
         )
     except Exception as e:
         logger.error(f"Error creating client for {component_name}: {e}")
@@ -852,24 +1197,32 @@ async def unified_astream(client, messages):
         yield f"[Error: {str(e)}]"
 
 def validate_ollama_model(model_name):
-    # (Kept identical to original)
+    """Checks if model exists locally; attempts to pull if not."""
+    # Only runs for local ollama (no endpoint in config)
     try:
+        # Check if Ollama is running
         subprocess.check_output(["curl", "http://localhost:11434"], stderr=subprocess.STDOUT, shell=True)
     except Exception:
-        pass # Handle silently or via UI
+        # Ollama not running or not reachable via curl
+        return 
+
     try:
+        # Check list of models
         output = subprocess.check_output(["ollama", "list"], text=True, shell=True)
         if model_name not in output:
-            pass # UI handles pulling usually
-    except Exception:
-        pass
+            print(f"Model '{model_name}' not found locally. Attempting background pull...")
+            # Attempt to pull in a separate non-blocking process
+            subprocess.Popen(["ollama", "pull", model_name])
+            messagebox.showinfo("Ollama Manager", f"Model '{model_name}' was not found.\n\nA background download has started.\nPlease wait a few moments before chatting.")
+    except Exception as e:
+        print(f"Validation error: {e}")
 
 #==============================================
 
-CLIENT = get_llm_client("main")
-if CLIENT is None:
+#CLIENT = get_llm_client("main")
+#if CLIENT is None:
     # Fallback to avoid crash if main config is bad, allows UI to load
-    print("Warning: Main Client failed to load. Using basic fallback or None.")
+    #print("Warning: Main Client failed to load. Using basic fallback or None.")
 
 
 
@@ -1392,52 +1745,70 @@ def embed_chunks(chunks):
         return np.array([])
     return embed_model.encode(chunks, convert_to_numpy=True)
 
-def query_index(question, chunks, index, k=15):
-    """Query the FAISS index for relevant chunks with deduplication."""
+def query_index(question, chunks, index, k=5, threshold=None):
+    """Query the FAISS index for relevant chunks with deduplication and thresholding."""
     if embed_model is None or not chunks:
         return chunks[:k] if chunks else []
 
     # 1. Search the index
     q_emb = embed_model.encode([question], convert_to_numpy=True)
+    
     # Search for more than k to have a pool for filtering
-    D, I = index.search(q_emb, min(len(chunks), 2 * k))
+    search_k = min(len(chunks), 2 * k)
+    D, I = index.search(q_emb, search_k)
+    
     candidate_indices = I[0]
+    candidate_distances = D[0]
 
     question_keywords = set(question.lower().split())
     filtered_chunks = []
     seen_content = set() # To track unique content
 
-    # 2. Add unique chunks
-    for idx in candidate_indices:
-        if idx < len(chunks):
+    # 2. Add unique chunks filtering by Threshold and Keywords
+    for idx, dist in zip(candidate_indices, candidate_distances):
+        # Skip if index is invalid (Faiss returns -1 if not found)
+        if idx < 0 or idx >= len(chunks):
+            continue
+
+        # --- NEW: Apply Threshold Check ---
+        if threshold is not None and dist > threshold:
+            continue
+        # ----------------------------------
+
+        chunk = chunks[idx]
+        # Normalize for comparison
+        content_hash = hashlib.md5(chunk.strip().encode()).hexdigest()
+        
+        if content_hash not in seen_content:
+            # Optional: keyword relevance check
+            chunk_keywords = set(chunk.lower().split())
+            if any(keyword in chunk_keywords for keyword in question_keywords):
+                filtered_chunks.append(chunk)
+                seen_content.add(content_hash)
+        
+        if len(filtered_chunks) == k:
+            break
+
+    # 3. Fallback: If we didn't find enough keyword-matching chunks, 
+    # add other unique chunks from the candidates (that still pass threshold)
+    if len(filtered_chunks) < k:
+        for idx, dist in zip(candidate_indices, candidate_distances):
+            if idx < 0 or idx >= len(chunks): continue
+            
+            # --- NEW: Apply Threshold Check ---
+            if threshold is not None and dist > threshold:
+                continue
+            # ----------------------------------
+
             chunk = chunks[idx]
-            # Normalize for comparison
             content_hash = hashlib.md5(chunk.strip().encode()).hexdigest()
             
             if content_hash not in seen_content:
-                # Optional: keyword relevance check
-                chunk_keywords = set(chunk.lower().split())
-                if any(keyword in chunk_keywords for keyword in question_keywords):
-                    filtered_chunks.append(chunk)
-                    seen_content.add(content_hash)
+                filtered_chunks.append(chunk)
+                seen_content.add(content_hash)
             
             if len(filtered_chunks) == k:
                 break
-
-    # 3. Fallback: If we didn't find enough keyword-matching chunks, 
-    # add other unique chunks from the candidates until we hit k
-    if len(filtered_chunks) < k:
-        for idx in candidate_indices:
-            if idx < len(chunks):
-                chunk = chunks[idx]
-                content_hash = hashlib.md5(chunk.strip().encode()).hexdigest()
-                
-                if content_hash not in seen_content:
-                    filtered_chunks.append(chunk)
-                    seen_content.add(content_hash)
-                
-                if len(filtered_chunks) == k:
-                    break
 
     return filtered_chunks
 #==================================================================
@@ -2601,40 +2972,45 @@ class PromptHandler:
         doc_context = ""
         if doc_rag_manager and doc_rag_manager.active_indices:
             try:
-                doc_context = doc_rag_manager.query_active_files(search_text, k=5)
+                doc_context = "RELEVANT DOCUMENTS:\n" + doc_rag_manager.query_active_files(search_text, k=5)
             except Exception as e:
                 logger.error(f"Error in Doc RAG: {e}")
-
-        rag_metadata = self.memory_manager.embedding_manager.retrieve_metadata_context(
-            metadata=prompt_metadata, k=rag_k_val, current_chat_file=self.memory_manager.memory_file
-        )
-        
-        context_text = ""
-        if use_semantic_memory and self.memory_manager.embedding_manager:
-            relevant_contexts = self.memory_manager.embedding_manager.retrieve_relevant_context(
-                search_text, k=rag_k_val, current_chat_file=self.memory_manager.memory_file
+                
+        context_text = ""                
+        rag_metadata = ""
+        if rag_k_val >0:
+            rag_metadata = "METADATA:\n" + self.memory_manager.embedding_manager.retrieve_metadata_context(
+                metadata=prompt_metadata, k=rag_k_val, current_chat_file=self.memory_manager.memory_file
             )
-            if relevant_contexts:
-                context_text = self.memory_manager.embedding_manager.format_retrieved_context(relevant_contexts)
+        
+
+            if use_semantic_memory and self.memory_manager.embedding_manager:
+                relevant_contexts = self.memory_manager.embedding_manager.retrieve_relevant_context(
+                    search_text, k=rag_k_val, current_chat_file=self.memory_manager.memory_file
+                )
+                if relevant_contexts:
+                    context_text = "SEMANTIC MATCHES:\n" + self.memory_manager.embedding_manager.format_retrieved_context(relevant_contexts)
 
         episodic_text = ""
-        if use_semantic_memory and self.episodic_manager:
-            episodic_text = self.episodic_manager.retrieve(search_text, n_results=episodic_k_val, target="episodes")
+        if episodic_k_val >0:
+            if use_semantic_memory and self.episodic_manager:
+                episodic_text = "LEARNT LESSONS:\n" + self.episodic_manager.retrieve(search_text, n_results=episodic_k_val, target="episodes")
 
         summary_text = ""
-        if use_chat_summaries and self.episodic_manager:
-            summary_text = self.episodic_manager.retrieve(search_text, n_results=summary_k_val, target="summary")
+        if summary_k_val >0:
+            if use_chat_summaries and self.episodic_manager:
+                summary_text = "PAST SUMMARIES:\n" + self.episodic_manager.retrieve(search_text, n_results=summary_k_val, target="summary")
 
         # --- 2. COSTRUZIONE DEL BLOCCO CONTESTO ---
         full_context_block = (
             "--- ADDITIONAL CONTEXT FROM YOUR LONG-TERM MEMORY ---\n"
-            f"RELEVANT DOCUMENTS: {doc_context if doc_context else 'None'}\n"
-            f"LEARNT LESSONS: {episodic_text if episodic_text else 'None'}\n"
-            f"PAST SUMMARIES: {summary_text if summary_text else 'None'}\n"
-            f"SEMANTIC MATCHES: {context_text if context_text else 'None'}\n"
-            f"METADATA: {rag_metadata if rag_metadata else 'None'}\n"
+            f"{doc_context if doc_context else ''}\n"
+            f"{episodic_text if episodic_text else ''}\n"
+            f"{summary_text if summary_text else ''}\n"
+            f"{context_text if context_text else ''}\n"
+            f"{rag_metadata if rag_metadata else ''}\n"
             "--- END OF CONTEXT ---\n"
-            "\n\nUse the relevant parts of the context above to answer the user's last question. If the context doesn't contain the answer, rely on your general knowledge but mention it. ENSURE YOU ANSWER IN THE USER'S LANGUAGE.\n"
+            "\n\nTASK: Use the relevant parts of the context above to answer the user's last question. If the context doesn't contain the answer, rely on your general knowledge but mention it. ENSURE YOU ANSWER IN THE USER'S LANGUAGE.\n"
         )
         
         # --- 3. AGGIORNAMENTO CRONOLOGIA ---
@@ -2643,12 +3019,9 @@ class PromptHandler:
         self.memory_manager.add_message(current_user_msg)
 
         # --- 4. COSTRUZIONE LISTA MESSAGGI STRUTTURATA (FIXATA) ---
+        combined_system_content = f"{system_prompt}\n\n{full_context_block}"
         structured_messages = [
-            
-            SystemMessage(content=system_prompt),
-            
-            # Indice 1: Il contesto RAG (DEVE essere un SystemMessage)
-            SystemMessage(content=full_context_block) 
+            SystemMessage(content=combined_system_content)
         ]
 
         # Aggiungiamo tutta la cronologia corrente (User e AI)
@@ -2832,7 +3205,7 @@ class CrewChatUI:
         analytics_window = tk.Toplevel(self.root)
         analytics_window.title("Excel Analytics Dashboard")
         analytics_window.configure(bg="#1e1e1e")
-        analytics_window.geometry("1600x1200")
+        analytics_window.geometry("3200x2400")
         text_frame = tk.Frame(analytics_window, bg="#1e1e1e")
         text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         analytics_text = tk.Text(
@@ -3010,7 +3383,7 @@ class CrewChatUI:
         """Initialize the user interface components"""
         self.root.title("M.A.I.A. - Enhanced Semantic Memory")
         self.root.configure(bg="#1e1e1e")
-        self.root.geometry("1800x1000")
+        self.root.geometry("3600x2000")
 
         self.top_frame = tk.Frame(self.root, bg="#1e1e1e")
         self.top_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -3284,7 +3657,7 @@ class CrewChatUI:
         """Window to manage attached files and activate RAG."""
         rag_win = tk.Toplevel(self.root)
         rag_win.title("Attached Files & RAG Manager")
-        rag_win.geometry("600x700")
+        rag_win.geometry("1200x1400")
         rag_win.configure(bg="#1e1e1e")
 
         tk.Label(rag_win, text="ATTACHED FILES", bg="#1e1e1e", fg="#4ea1ff", font=("Arial", 12, "bold")).pack(pady=10)
@@ -3381,7 +3754,7 @@ class CrewChatUI:
     def open_creative_mode(self):
         creative_window=tk.Toplevel(self.root, bg="#1e1e1e")
         creative_window.title("Creative Mode")
-        creative_window.geometry("1600x1200")
+        creative_window.geometry("3200x2400")
         tk.Label(creative_window, text="Choose an option:", bg="#1e1e1e", fg="#ffffff").pack(pady=10)
         button_frame = tk.Frame(creative_window, bg="#1e1e1e")
         button_frame.pack(pady=10)
@@ -3415,7 +3788,7 @@ class CrewChatUI:
         """Open coding mode window"""
         coding_window = tk.Toplevel(self.root, bg="#1e1e1e")
         coding_window.title("Coding Mode")
-        coding_window.geometry("1600x1200")
+        coding_window.geometry("3200x2400")
         tk.Label(coding_window, text="Coding Mode Activated", bg="#1e1e1e", fg="#12e220").pack(pady=10)
         # Additional coding mode UI components can be added here
         codeduo_button = tk.Button(
@@ -4405,7 +4778,7 @@ def restore_memory():
         """Opens the Memory Handler Panel with multiple options."""
         root=ROOT
         memory_panel_win = tk.Toplevel(root)
-        memory_panel_win.geometry("600x400") # Increased height for 3 rows
+        memory_panel_win.geometry("1200x800") # Increased height for 3 rows
         memory_panel_win.title("Memory Handler")
         memory_panel_win.configure(bg="#1e1e1e")
 
@@ -4413,7 +4786,7 @@ def restore_memory():
         def create_log_window(title):
             win = tk.Toplevel(memory_panel_win)
             win.title(title)
-            win.geometry("650x500")
+            win.geometry("1300x1000")
             win.configure(bg="#1e1e1e")
             
             lbl = tk.Label(win, text="Initializing...", bg="#1e1e1e", fg="white", font=("Segoe UI", 10))
@@ -4745,7 +5118,7 @@ def open_other_settings_ui(parent_win):
     """UI for configuring Retrieval, Search, and Memory parameters."""
     win = tk.Toplevel(parent_win)
     win.title("Other Settings (Retrieval & Search)")
-    win.geometry("600x800") # Increased size
+    win.geometry("1200x1800") # Increased size slightly
     win.configure(bg="#2d2d2d")
 
     # Load defaults
@@ -4757,6 +5130,11 @@ def open_other_settings_ui(parent_win):
     episodic_var = tk.StringVar(value=str(current_conf.get("episodic_k", 12)))
     summary_var = tk.StringVar(value=str(current_conf.get("summary_k", 3)))
     
+    # --- NEW VARIABLES FOR DOCUMENT RAG ---
+    doc_k_var = tk.StringVar(value=str(current_conf.get("doc_rag_k", 5)))
+    doc_thresh_var = tk.StringVar(value=str(current_conf.get("doc_rag_threshold", 2.0)))
+    # --------------------------------------
+
     # Search
     google_var = tk.StringVar(value=str(current_conf.get("google_k", 5)))
     
@@ -4777,13 +5155,18 @@ def open_other_settings_ui(parent_win):
         lbl = tk.Label(frame, text=label_text, bg="#2d2d2d", fg="white", width=40, anchor="w")
         lbl.pack(side="left")
         tk.Entry(frame, textvariable=var, bg="#3a3a3a", fg="white", insertbackground="white", width=10).pack(side="right")
-        # Simple tooltip logic could go here if needed
 
     # --- Layout ---
     add_section("Context Window (Items to Retrieve)")
     add_setting_row("Semantic Context (From Past Chats):", rag_var)
     add_setting_row("Episodic Memories (Facts):", episodic_var)
     add_setting_row("Chat Summaries:", summary_var)
+
+    # --- NEW SECTION IN UI ---
+    add_section("Document RAG Settings")
+    add_setting_row("Doc Chunks per File (K):", doc_k_var)
+    add_setting_row("Doc Distance Threshold (Lower=Stricter):", doc_thresh_var)
+    # -------------------------
 
     add_section("Context Truncation (Max Characters)")
     add_setting_row("Topic/Metadata Context Length:", topic_trunc_var)
@@ -4809,7 +5192,11 @@ def open_other_settings_ui(parent_win):
                 "consolidation_threshold": float(cons_thresh_var.get()),
                 "max_history": int(history_var.get()),
                 "topic_truncation": int(topic_trunc_var.get()),
-                "semantic_truncation": int(sem_trunc_var.get())
+                "semantic_truncation": int(sem_trunc_var.get()),
+                
+                # --- SAVE NEW VALUES ---
+                "doc_rag_k": int(doc_k_var.get()),
+                "doc_rag_threshold": float(doc_thresh_var.get())
             }
             LLM_CONFIG["retrieval"] = new_conf
             
@@ -4826,24 +5213,118 @@ def open_other_settings_ui(parent_win):
 
     tk.Button(win, text="Save Settings", command=save_settings, bg="#2ecc71", fg="white", font=("Segoe UI", 10, "bold"), padx=20, pady=10).pack(pady=30)
 
+def open_directory_settings_ui(parent_win):
+    """UI for configuring Local LLM Directories (HF & Ollama)."""
+    win = tk.Toplevel(parent_win)
+    win.title("Define Local Model Directories")
+    win.geometry("1400x700")
+    win.configure(bg="#2d2d2d")
+
+    # Load current values
+    current_dirs = LLM_CONFIG.get("directories", DEFAULT_CONFIG["directories"])
+    
+    hf_var = tk.StringVar(value=current_dirs.get("hf_home", ""))
+    ollama_var = tk.StringVar(value=current_dirs.get("ollama_models", ""))
+
+    def browse_dir(var):
+        path = filedialog.askdirectory()
+        if path:
+            var.set(path)
+
+    def add_row(label_text, var, tooltip_text):
+        frame = tk.Frame(win, bg="#2d2d2d")
+        frame.pack(fill="x", padx=20, pady=10)
+        
+        lbl = tk.Label(frame, text=label_text, bg="#2d2d2d", fg="#4ea1ff", font=("Segoe UI", 10, "bold"), width=20, anchor="w")
+        lbl.pack(side="left")
+        
+        entry = tk.Entry(frame, textvariable=var, bg="#3a3a3a", fg="white", insertbackground="white")
+        entry.pack(side="left", fill="x", expand=True, padx=5)
+        
+        btn = tk.Button(frame, text="Browse", command=lambda: browse_dir(var), bg="#555", fg="white")
+        btn.pack(side="right")
+        
+        # Tooltip/Info line
+        info_lbl = tk.Label(win, text=tooltip_text, bg="#2d2d2d", fg="#aaaaaa", font=("Segoe UI", 8, "italic"), anchor="w")
+        info_lbl.pack(fill="x", padx=25, pady=(0, 10))
+
+    tk.Label(win, text="Local Model Storage Paths", bg="#2d2d2d", fg="white", font=("Segoe UI", 12, "bold")).pack(pady=15)
+
+    # HuggingFace Row
+    add_row("HuggingFace Home:", hf_var, 
+            "Destination for downloaded Transformers/HF models. (Sets HF_HOME)")
+
+    # Ollama Row
+    add_row("Ollama Models:", ollama_var, 
+            "Destination for Ollama blobs/manifests. (Sets OLLAMA_MODELS). Restart Ollama service after changing.")
+
+    def save_dirs():
+        new_dirs = {
+            "hf_home": hf_var.get().strip(),
+            "ollama_models": ollama_var.get().strip()
+        }
+        
+        # Save to config
+        LLM_CONFIG["directories"] = new_dirs
+        save_config(LLM_CONFIG)
+        
+        # Apply immediately to current session env vars
+        if new_dirs["hf_home"]: 
+            os.environ["HF_HOME"] = new_dirs["hf_home"]
+            os.environ["TRANSFORMERS_CACHE"] = new_dirs["hf_home"]
+            
+        if new_dirs["ollama_models"]:
+            os.environ["OLLAMA_MODELS"] = new_dirs["ollama_models"]
+            
+        messagebox.showinfo("Saved", "Directories saved.\n\nFor HuggingFace: Applied immediately.\nFor Ollama: You may need to restart the Ollama service for this to take effect.")
+        win.destroy()
+
+    btn_frame = tk.Frame(win, bg="#2d2d2d")
+    btn_frame.pack(fill="x", pady=20)
+    
+    tk.Button(btn_frame, text="Save & Apply", command=save_dirs, bg="#2ecc71", fg="white", font=("Segoe UI", 10, "bold"), width=20).pack()
 
 def open_custom_llm_ui(root_window):
     """Configuration UI."""
     config_win = tk.Toplevel(root_window)
     config_win.title("LLM Configuration")
-    config_win.geometry("800x750") # Increased height to fit button
+    config_win.geometry("1600x1800") 
     config_win.configure(bg="#1e1e1e")
 
     tk.Label(config_win, text="LLM Settings", bg="#1e1e1e", fg="white", font=("Segoe UI", 12, "bold")).pack(pady=10)
 
-    # --- Scrollable Area Setup ---
+    # ============================================================
+    # 1. SETUP FOOTER (Buttons)
+    # ============================================================
+    btn_frame = tk.Frame(config_win, bg="#1e1e1e")
+    btn_frame.pack(side="bottom", fill="x", pady=10) 
+
+    # --- MODIFIED: SELECTIVE UNLOAD BUTTON ---
+    tk.Button(btn_frame, text="\u26A0\uFE0F Manage Loaded Models (Selective Unload) \u26A0\uFE0F", 
+              command=lambda: open_unload_selector(config_win),
+              bg="#c0392b", fg="white", font=("Segoe UI", 10, "bold"), 
+              relief="flat", pady=5).pack(side="top", fill="x", padx=20, pady=5)
+    # -----------------------------------------
+
+    # Bottom Button: Other Settings
+    tk.Button(btn_frame, text="Other Settings (Retrieval & Search)", 
+              command=lambda: open_other_settings_ui(config_win),
+              bg="#8e44ad", fg="white", font=("Segoe UI", 10, "bold")).pack(side="bottom", fill="x", padx=20, pady=(2, 0))
+
+    # Top Button (in footer): Directories
+    tk.Button(btn_frame, text="Define Directories (Download Paths)", 
+            command=lambda: open_directory_settings_ui(config_win),
+            bg="#2980b9", fg="white", font=("Segoe UI", 10, "bold")).pack(side="bottom", fill="x", padx=20, pady=(5, 2))
+
+    # ============================================================
+    # 2. SETUP SCROLLABLE AREA
+    # ============================================================
     canvas = tk.Canvas(config_win, bg="#1e1e1e", highlightthickness=0)
     scrollbar = ttk.Scrollbar(config_win, orient="vertical", command=canvas.yview)
     scrollable_frame = tk.Frame(canvas, bg="#1e1e1e")
 
     scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
     
-    # Window ID for resizing logic
     frame_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
     
     def resize_frame(event):
@@ -4852,10 +5333,12 @@ def open_custom_llm_ui(root_window):
 
     canvas.configure(yscrollcommand=scrollbar.set)
 
-    # Pack scrollbar and canvas - BUT leave space at bottom for the new button
-    scrollbar.pack(side="right", fill="y", pady=(0, 60)) 
-    canvas.pack(side="left", fill="both", expand=True, pady=(0, 60))
+    scrollbar.pack(side="right", fill="y") 
+    canvas.pack(side="left", fill="both", expand=True)
 
+    # ============================================================
+    # 3. POPULATE LIST
+    # ============================================================
     components = ["main", "router", "refiner", "coder", "summarizer", "memory_analyzer", "memory_consolidator"]
     
     for comp in components:
@@ -4870,14 +5353,6 @@ def open_custom_llm_ui(root_window):
         
         tk.Button(frame, text=status, command=lambda c=comp: configure_component(c, config_win),
                   bg="#34495e", fg="white", width=30).pack(side=tk.RIGHT)
-
-    # --- NEW: OTHER SETTINGS BUTTON (Fixed at bottom) ---
-    btn_frame = tk.Frame(config_win, bg="#1e1e1e")
-    btn_frame.place(relx=0, rely=1.0, anchor="sw", relwidth=1.0, height=60) # Placed at bottom overlay
-    
-    tk.Button(btn_frame, text="Other Settings (Retrieval & Search)", 
-              command=lambda: open_other_settings_ui(config_win),
-              bg="#8e44ad", fg="white", font=("Segoe UI", 10, "bold")).pack(fill="both", expand=True, padx=20, pady=10)
     
 
 
@@ -4890,7 +5365,7 @@ def configure_component(component, parent_win):
     """Detail config window."""
     win = tk.Toplevel(parent_win)
     win.title(f"Config: {component}")
-    win.geometry("800x900")
+    win.geometry("1600x1800")
     win.configure(bg="#2d2d2d")
     
     # Load defaults
@@ -4901,6 +5376,8 @@ def configure_component(component, parent_win):
     provider_var = tk.StringVar(value=current_conf.get("provider", "ollama"))
     model_var = tk.StringVar(value=current_conf.get("model", DEFAULT_MODEL))
     apikey_var = tk.StringVar(value=current_conf.get("api_key", ""))
+    endpoint_var = tk.StringVar(value=current_conf.get("endpoint", ""))
+    apiversion_var = tk.StringVar(value=current_conf.get("api_version", ""))
     
     temp_var = tk.StringVar(value=str(current_conf.get("temperature", 0.7)))
     topp_var = tk.StringVar(value=str(current_conf.get("top_p", 0.9)))
@@ -4953,12 +5430,19 @@ def configure_component(component, parent_win):
     for p in providers:
         tk.Radiobutton(p_frame, text=p.title(), variable=provider_var, value=p, bg="#2d2d2d", fg="white", selectcolor="#2d2d2d").pack(side="left", padx=5)
 
-    # Model & API
+    # --- UI Layout for Model, API Key, AND ENDPOINT ---
     tk.Label(content_padding, text="Model Name:", bg="#2d2d2d", fg="white", font=("Segoe UI", 10, "bold")).pack(pady=(15,5), anchor="w")
     tk.Entry(content_padding, textvariable=model_var, bg="#3a3a3a", fg="white", insertbackground="white").pack(anchor="w", fill="x")
     
-    tk.Label(content_padding, text="API Key (Cloud):", bg="#2d2d2d", fg="white", font=("Segoe UI", 10, "bold")).pack(pady=(15,5), anchor="w")
+    # New Endpoint Field
+    tk.Label(content_padding, text="Endpoint URL (e.g. https://api.ollama.com or http://localhost:11434):", bg="#2d2d2d", fg="white", font=("Segoe UI", 10, "bold")).pack(pady=(15,5), anchor="w")
+    tk.Entry(content_padding, textvariable=endpoint_var, bg="#3a3a3a", fg="white", insertbackground="white").pack(anchor="w", fill="x")
+
+    tk.Label(content_padding, text="API Key (Ollama Cloud / OpenAI / etc.):", bg="#2d2d2d", fg="white", font=("Segoe UI", 10, "bold")).pack(pady=(15,5), anchor="w")
     tk.Entry(content_padding, textvariable=apikey_var, show="*", bg="#3a3a3a", fg="white", insertbackground="white").pack(anchor="w", fill="x")
+    
+    tk.Label(content_padding, text="API Version (Azure only, e.g., 2024-02-15-preview):", bg="#2d2d2d", fg="white", font=("Segoe UI", 10, "bold")).pack(pady=(15,5), anchor="w")
+    tk.Entry(content_padding, textvariable=apiversion_var, bg="#3a3a3a", fg="white", insertbackground="white").pack(anchor="w", fill="x")
 
     # Numeric Settings
     settings_frame = tk.Frame(content_padding, bg="#2d2d2d")
@@ -5020,6 +5504,8 @@ def configure_component(component, parent_win):
             "provider": prov,
             "model": mod,
             "api_key": apikey_var.get().strip(),
+            "endpoint": endpoint_var.get().strip(),
+            "api_version": apiversion_var.get().strip(),
             "temperature": t_val,
             "top_p": p_val,
             "max_tokens": tok_val,
@@ -5048,7 +5534,7 @@ def select_or_new_chat():
     root = TkinterDnD.Tk()
     root.title("M.A.I.A. Start")
     root.configure(bg="#1e1e1e")
-    root.geometry("650x450") # Increased height
+    root.geometry("1300x600") # Increased height
     choice = {"file": None}
     global ROOT
     ROOT=root
@@ -5099,7 +5585,46 @@ def select_or_new_chat():
     root.mainloop()
     return choice["file"]
 
+def perform_shutdown_cleanup():
+    """
+    Clears RAM, VRAM, and unloads Ollama models before exit.
+    """
+    print("\n--- INITIATING SHUTDOWN CLEANUP ---")
+    
+    # 1. HUGGINGFACE & PYTORCH CLEANUP
+    global LOADED_HF_PIPELINES
+    if LOADED_HF_PIPELINES:
+        print(f"Unloading {len(LOADED_HF_PIPELINES)} HF Pipelines...")
+        LOADED_HF_PIPELINES.clear()
+    
+    import gc
+    gc.collect()
+    
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            print("CUDA VRAM cache cleared.")
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            print("MPS (Mac) RAM cache cleared.")
+    except ImportError:
+        pass
 
+    # 2. OLLAMA CLEANUP
+    # We use the helper function we added earlier to find what's running
+    try:
+        active_ollama = get_ollama_loaded_models()
+        if active_ollama:
+            print(f"Unloading active Ollama models: {active_ollama}")
+            for model in active_ollama:
+                # We reuse your existing unload function
+                unload_specific_model("ollama", model)
+    except Exception as e:
+        print(f"Error cleaning up Ollama: {e}")
+
+    print("--- CLEANUP COMPLETE ---")
 
 
 
@@ -5124,14 +5649,30 @@ def main():
         app = CrewChatUI(root, router, refiner, coder, memory_manager, embedding_manager, prompthandler, episodic_manager)
 
         def on_closing():
-            app.save_chat()
-            root.destroy()
+            # Optional: Ask for confirmation
+            if messagebox.askokcancel("Quit", "Do you want to save & quit?"):
+                # 1. Update UI to show we are closing
+                root.title("M.A.I.A. - Shutting down...")
+                
+                # 2. Save Data
+                app.save_chat()
+                
+                # 3. Perform Memory Cleanup
+                perform_shutdown_cleanup()
+                
+                # 4. Destroy Window
+                root.destroy()
+                
+                # 5. Force Kill (Optional, ensures all threads stop)
+                import sys
+                sys.exit(0)
     
         root.protocol("WM_DELETE_WINDOW", on_closing)
         root.mainloop()
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
-        messagebox.showerror("Error", f"Application error: {str(e)}")
+        # We can't use messagebox here if root is not created yet or destroyed
+        print(f"Application error: {str(e)}")
 
 if __name__ == "__main__":
     main()

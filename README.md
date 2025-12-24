@@ -113,14 +113,13 @@ Clicking on the model name allows you to set:
 
 1.  **Provider** – Model provider
 2.  **Model Name** – Model name according to the provider
-3.  **API Key (Cloud)**
-    *   ChatOllama and HuggingFace do not require an API Key
-    *   Azure requires **endpoint + API Key**, separated by `|`
-        *Example:* `https://my-endpoint.com/|MY_API_KEY`
-4.  **Temperature** – Controls the model's creativity
-5.  **Top P (0–0.99)** – Response sampling breadth
-6.  **Max Tokens** – Maximum response length
-7.  **System Prompt (Instructions)** – Basic model instructions
+3.  **API Key (Cloud)** - Ollama and HuggingFace do not require an API Key, unless they are cloud models
+4.  **Endpoint** - Required for some cloud providers, such Azure and Ollama's cloud models
+5.  **Temperature** – Controls the model's creativity
+6.  **Top P (0–0.99)** – Response sampling breadth
+7.  **Max Tokens** – Maximum response length
+    *It is recommended not to increase the Max Tokens above 2048 for small models, as it may trap them in a loop of hallucinations.*
+8.  **System Prompt (Instructions)** – Basic model instructions
     *It is recommended not to modify these, except for the Main agent*
 
 Click the button at the bottom of the window to **save the configuration**.
@@ -155,10 +154,11 @@ A notification will confirm the prompt was sent.
 3.  **Advanced Tasks (ON/OFF)** – Activates the Router to automate tasks
 4.  **Dataframe Reader (ON/OFF)** – Enables the Coder agent for Excel/CSV files
 5.  **File** – File upload and management (.pdf, .xlsx, .csv, .docx) (*Beta*)
-6.  **LLM Config** – Opens the model configuration
-7.  **Memory Manager** – Opens the Memory Handler
-8.  **Coding Mode** – Assisted Python code development with dual AI (*Beta*)
-9.  **Pinned (ON/OFF)** – Keeps the window always on top
+6.  **Print Files** - Will only print the list of the attached files to screen.
+7.  **LLM Config** – Opens the model configuration
+8.  **Memory Manager** – Opens the Memory Handler
+9.  **Coding Mode** – Assisted Python code development with dual AI (*Beta*)
+10.  **Pinned (ON/OFF)** – Keeps the window always on top
 
 ### FIle Upload Update:
 The program now allows to upload multiple files and select them for Retrieval Augmented Generation. 
